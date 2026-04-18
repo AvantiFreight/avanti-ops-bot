@@ -10,62 +10,105 @@ const GOOGLE_KEY = process.env.GOOGLE_API_KEY;
 const SHEET_ID = '1fDdMfqzat1XGbbc9G3bbI1x9QN-gFM3Udc-nUAtT3QM';
 const SHEET_NAME = 'Booked Jobs';
 
-async function getSheetData() {
+function parseDate(str) {
+  if (!str || str.trim() === '') return null;
+  str = str.trim();
+  const year = new Date().getFullYear();
+  const md = str.match(/^(\d{1,2})\/(\d{1,2})(?:\/\d{2,4})?$/);
+  if (md) return new Date(year, parseInt(md[1]) - 1, parseInt(md[2]));
+  const full = new Date(str);
+  if (!isNaN(full)) return full;
+  return null;
+}
+
+function stripDollar(str) {
+  if (!str) return 0;
+  return parseFloat(str.replace(/[$,\s]/g, '')) || 0;
+}
+
+async function getJobs() {
   const range = encodeURIComponent(SHEET_NAME + '!A:W');
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${range}?key=${GOOGLE_KEY}`;
   const res = await fetch(url);
   const data = await res.json();
   if (!data.values) throw new Error('No sheet data');
-  return data.values.map(r => r.join('\t')).join('\n');
+
+  const rows = data.values;
+
+  // Find header row — look for any row where col A is 'Job #'
+  let headerIdx = -1;
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i][0] && rows[i][0].toString().trim() === 'Job #') {
+      headerIdx = i;
+      break;
+    }
+  }
+  if (headerIdx === -1) throw new Error('Could not find header row with "Job #"');
+
+  const headers = rows[headerIdx].map(h => (h || '').trim());
+  console.log('Headers found:', headers.join(' | '));
+
+  const jobs = [];
+  for (let i = headerIdx + 1; i < rows.length; i++) {
+    const r = rows[i];
+    if (!r[0] || !r[0].toString().trim().startsWith('A')) continue;
+    const obj = {};
+    headers.forEach((h, idx) => { obj[h] = (r[idx] || '').trim(); });
+    jobs.push(obj);
+  }
+
+  console.log(`Loaded ${jobs.length} jobs`);
+  return { jobs, headers };
 }
 
-async function askClaude(question, sheetData) {
+function getSvcDate(job, headers) {
+  // Try exact match first, then partial match for "Initial Service"
+  const candidates = ['Initial Service', 'Initial Service Date', 'Service Date'];
+  for (const c of candidates) {
+    if (job[c] !== undefined) return job[c];
+  }
+  // fallback: find any header containing "service" (case-insensitive)
+  const key = headers.find(h => h.toLowerCase().includes('service') && h.toLowerCase().includes('initial'));
+  return key ? job[key] : '';
+}
+
+function getUpcomingJobs(jobs, headers, days) {
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const end = new Date(today);
+  end.setDate(end.getDate() + days);
+
+  return jobs.filter(j => {
+    const raw = getSvcDate(j, headers);
+    const d = parseDate(raw);
+    if (!d) return false;
+    return d >= today && d <= end;
+  }).sort((a, b) => {
+    return parseDate(getSvcDate(a, headers)) - parseDate(getSvcDate(b, headers));
+  });
+}
+
+function getBalances(jobs) {
+  return jobs.filter(j => stripDollar(j['Remaining Balance']) > 0);
+}
+
+function getStorageJobs(jobs) {
+  return jobs.filter(j => (j['Order Status'] || '').toLowerCase().includes('storage'));
+}
+
+function formatJob(j, headers) {
+  const bal = stripDollar(j['Remaining Balance']);
+  const balStr = bal > 0 ? ` | $${bal.toLocaleString()} due ${j['Remaining Balance Bill Date']}` : ' | Paid in full';
+  const svcDate = getSvcDate(j, headers) || 'TBD';
+  const phone = j[''] || '';
+  const col3 = headers[2] ? j[headers[2]] : '';
+  return `${j['Job #']} | ${col3} | ${j['From State']}→${j['To State']} | ${j['Service Provider']} | Svc: ${svcDate}${balStr} | ${j['Order Status']}`;
+}
+
+async function askClaude(question, context) {
   const today = new Date().toLocaleDateString('en-US', {
     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
   });
-
-  const systemPrompt = `You are Avanti Ops, an internal operations assistant for Avanti Freight Solutions — a self-service moving brokerage. Answer questions about active jobs based on live Google Sheet data provided to you.
-
-Today's date: ${today}
-
-Business model: Sources vendor capacity (PODS, Estes, 1800PackRat, etc.), marks up pricing, sells retail. Revenue = margin between vendor cost and customer sell price. Payment: 100% upfront OR 50/50 deposit/balance.
-
-Services:
-- Container moves: PODS (primary), Pack-Rat/Zippy Shell, UNITS
-- Drop-trailer/self-load: Estes SureMove (primary), Old Dominion
-
-Sheet columns (tab-separated): Job #, Vendor Order #, Phone, Email, Booked Date, Initial Service Date, Order Status, From State, To State, Service Provider, Total Vendor Cost, Vendor Storage, Avanti Storage, Sold Price (Avanti), Avanti Margin, Avanti Margin (%), Deposit Amount, Deposit Collected Date, Payment Method, Remaining Balance, Remaining Balance Bill Date, Remaining Balance Payment Method, Notes
-
-CRITICAL QUERY RULES — always follow these exactly:
-
-UPCOMING SERVICE / DROP-OFFS / WHO IS GETTING SERVICED:
-When asked who is getting serviced, who has a drop-off, upcoming jobs, next 7 days, this week, or any variation:
-1. Scan EVERY row in the data from top to bottom — do not stop early
-2. Filter ONLY by Initial Service Date — use no other column as a filter
-3. Default window: today through today + 7 days unless user specifies otherwise
-4. EXCLUDE any job where Initial Service Date is before today, regardless of Order Status
-5. INCLUDE all job types — moves AND onsite storage both count
-6. Return: Job #, Phone, Origin to Destination, Vendor, Initial Service Date, Sell Price, Balance Due, Order Status
-7. Sort ascending by Initial Service Date
-
-REMAINING BALANCES:
-Return all jobs where Remaining Balance > $0. Include bill date and job #.
-
-STORAGE JOBS:
-Return all jobs where Order Status contains Storage. Include vendor storage cost and Avanti storage charge.
-
-DAILY SUMMARY:
-1. Jobs with Initial Service Date = today
-2. Jobs with Initial Service Date within next 7 days
-3. Outstanding balances (Remaining Balance > $0)
-4. Future orders not yet serviced
-
-GENERAL RULES:
-- Be concise and direct. No fluff. Internal tool only.
-- Format as clean lists for multiple jobs.
-- Keep responses under 300 words — this is Telegram.
-- Never filter by Order Status unless explicitly asked to.
-- Always scan every single row — never stop early.`;
 
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -76,14 +119,12 @@ GENERAL RULES:
     },
     body: JSON.stringify({
       model: 'claude-haiku-4-5-20251001',
-      max_tokens: 1000,
-      system: systemPrompt,
-      messages: [
-        {
-          role: 'user',
-          content: `Here is the current job data from the Google Sheet:\n\n${sheetData}\n\n---\n\nQuestion: ${question}`
-        }
-      ]
+      max_tokens: 800,
+      system: `You are Avanti Ops, internal assistant for Avanti Freight Solutions. Today: ${today}. Be concise, direct, no fluff. Format as clean lists. Under 250 words.`,
+      messages: [{
+        role: 'user',
+        content: `Question: ${question}\n\nData:\n${context}`
+      }]
     })
   });
 
@@ -95,12 +136,25 @@ GENERAL RULES:
   return data.content?.[0]?.text || 'No response from AI.';
 }
 
+function detectIntent(text) {
+  const t = text.toLowerCase();
+  if (t.match(/servic|drop.?off|pickup|this week|next \d+ days?|upcoming|getting a container|getting a trailer|being service/)) return 'upcoming';
+  if (t.match(/balanc|owed|outstanding|due|unpaid/)) return 'balances';
+  if (t.match(/storag/)) return 'storage';
+  if (t.match(/summar|daily|today/)) return 'summary';
+  return 'general';
+}
+
 async function sendTelegram(chatId, text) {
-  await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown' })
-  });
+  while (text.length > 0) {
+    const chunk = text.slice(0, 4000);
+    text = text.slice(4000);
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text: chunk })
+    });
+  }
 }
 
 app.post('/webhook', async (req, res) => {
@@ -108,22 +162,57 @@ app.post('/webhook', async (req, res) => {
   try {
     const msg = req.body?.message;
     if (!msg?.text) return;
-
     const chatId = msg.chat.id;
     const text = msg.text.trim();
 
     if (text === '/start') {
-      await sendTelegram(chatId, `*Avanti Ops* is online.\n\nAsk me anything about your jobs:\n- Who is getting serviced this week?\n- Who has outstanding balances?\n- Who needs storage billing?\n- Give me a daily summary`);
+      await sendTelegram(chatId, `Avanti Ops is online.\n\nTry:\n- Who is getting serviced this week?\n- Who has outstanding balances?\n- Who is in storage?\n- Daily summary`);
       return;
     }
 
     await sendTelegram(chatId, 'Pulling sheet data...');
-    const sheetData = await getSheetData();
-    const answer = await askClaude(text, sheetData);
+    const { jobs, headers } = await getJobs();
+    const intent = detectIntent(text);
+    let context = '';
+
+    if (intent === 'upcoming') {
+      const daysMatch = text.match(/(\d+)\s*days?/);
+      const days = daysMatch ? parseInt(daysMatch[1]) : 7;
+      const upcoming = getUpcomingJobs(jobs, headers, days);
+      const todayStr = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+      const endDate = new Date(); endDate.setDate(endDate.getDate() + days);
+      const endStr = endDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+      context = upcoming.length > 0
+        ? `${upcoming.length} jobs with Initial Service Date from ${todayStr} to ${endStr}:\n${upcoming.map(j => formatJob(j, headers)).join('\n')}`
+        : `No jobs found with Initial Service Date between ${todayStr} and ${endStr}.`;
+    } else if (intent === 'balances') {
+      const bal = getBalances(jobs);
+      context = bal.length > 0
+        ? `${bal.length} jobs with outstanding balances:\n${bal.map(j => formatJob(j, headers)).join('\n')}`
+        : 'No outstanding balances.';
+    } else if (intent === 'storage') {
+      const storage = getStorageJobs(jobs);
+      context = storage.length > 0
+        ? `${storage.length} storage jobs:\n${storage.map(j => formatJob(j, headers)).join('\n')}`
+        : 'No storage jobs found.';
+    } else if (intent === 'summary') {
+      const upcoming = getUpcomingJobs(jobs, headers, 7);
+      const balances = getBalances(jobs);
+      const storage = getStorageJobs(jobs);
+      context = `SUMMARY\nUpcoming (7 days): ${upcoming.length} jobs\n${upcoming.map(j => formatJob(j, headers)).join('\n')}\n\nOutstanding balances: ${balances.length}\n${balances.map(j => formatJob(j, headers)).join('\n')}\n\nIn storage: ${storage.length}\n${storage.map(j => formatJob(j, headers)).join('\n')}`;
+    } else {
+      context = `All jobs (${jobs.length} total):\n${jobs.map(j => formatJob(j, headers)).join('\n')}`;
+    }
+
+    const answer = await askClaude(text, context);
     await sendTelegram(chatId, answer);
 
   } catch (e) {
-    console.error(e);
+    console.error('Webhook error:', e.message);
+    try {
+      const chatId = req.body?.message?.chat?.id;
+      if (chatId) await sendTelegram(chatId, `Error: ${e.message}`);
+    } catch {}
   }
 });
 
