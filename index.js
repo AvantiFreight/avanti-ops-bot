@@ -10,15 +10,7 @@ const GOOGLE_KEY = process.env.GOOGLE_API_KEY;
 const SHEET_ID = '1fDdMfqzat1XGbbc9G3bbI1x9QN-gFM3Udc-nUAtT3QM';
 const SHEET_NAME = 'Booked Jobs';
 
-// Column indices (0-based) — matches your sheet exactly
-// A=0: Job #, B=1: Vendor Order #, C=2: Phone, D=3: Email
-// E=4: Booked Date, F=5: Initial Service, G=6: Order Status
-// H=7: From State, I=8: To State, J=9: Service Provider
-// K=10: Total Vendor Cost, L=11: Vendor Storage, M=12: Avanti Storage
-// N=13: Sold Price, O=14: Avanti Margin, P=15: Avanti Margin %
-// Q=16: Deposit Amount, R=17: Deposit Collected, S=18: Payment Method
-// T=19: Remaining Balance, U=20: Remaining Balance Bill Date
-// V=21: Remaining Balance Payment Method, W=22: Notes
+// Column indices (0-based)
 const COL = {
   JOB: 0,
   VENDOR_ORDER: 1,
@@ -56,6 +48,10 @@ function parseDate(str) {
   return null;
 }
 
+function fmtDate(d) {
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
 function stripDollar(str) {
   if (!str) return 0;
   return parseFloat(str.toString().replace(/[$,\s]/g, '')) || 0;
@@ -73,21 +69,16 @@ async function getJobs() {
   if (!data.values) throw new Error('No sheet data');
 
   const rows = data.values;
-
-  // Find header row by looking for 'Job #' in col A
   let headerIdx = -1;
   for (let i = 0; i < rows.length; i++) {
-    const cell = (rows[i][0] || '').toString().trim();
-    if (cell === 'Job #') { headerIdx = i; break; }
+    if ((rows[i][0] || '').toString().trim() === 'Job #') { headerIdx = i; break; }
   }
   if (headerIdx === -1) throw new Error('Header row not found');
 
-  // Log actual headers so we can debug column mismatches
   const rawHeaders = rows[headerIdx];
   console.log('Header row index:', headerIdx);
   rawHeaders.forEach((h, i) => {
-    const clean = (h || '').toString().replace(/\n/g, '\\n').trim();
-    console.log(`  Col ${i} (${String.fromCharCode(65+i)}): "${clean}"`);
+    console.log(`  Col ${i} (${String.fromCharCode(65+i)}): "${(h||'').toString().replace(/\n/g,'\\n').trim()}"`);
   });
 
   const jobs = [];
@@ -97,14 +88,26 @@ async function getJobs() {
     if (!jobId || !jobId.startsWith('A')) continue;
     jobs.push(r);
   }
-
   console.log(`Loaded ${jobs.length} jobs`);
-  // Log first few initial service dates for debugging
-  jobs.slice(0, 5).forEach(j => {
-    console.log(`  ${get(j, COL.JOB)} | svc: "${get(j, COL.INITIAL_SERVICE)}" | status: "${get(j, COL.STATUS)}"`);
-  });
-
   return jobs;
+}
+
+// Calculate next storage billing date: initial service date + N*30 days
+// Returns the next upcoming billing date on or after today
+function nextBillingDate(svcDateStr) {
+  const svcDate = parseDate(svcDateStr);
+  if (!svcDate) return null;
+
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+  let billing = new Date(svcDate);
+  // Add 30 days at a time until we reach today or future
+  while (billing < today) {
+    billing = new Date(billing);
+    billing.setDate(billing.getDate() + 30);
+  }
+  return billing;
 }
 
 function getUpcomingJobs(jobs, days) {
@@ -113,18 +116,13 @@ function getUpcomingJobs(jobs, days) {
   const end = new Date(today);
   end.setDate(end.getDate() + days);
 
-  const result = jobs.filter(r => {
-    const raw = get(r, COL.INITIAL_SERVICE);
-    const d = parseDate(raw);
+  return jobs.filter(r => {
+    const d = parseDate(get(r, COL.INITIAL_SERVICE));
     if (!d) return false;
     return d >= today && d <= end;
-  });
-
-  result.sort((a, b) => {
-    return parseDate(get(a, COL.INITIAL_SERVICE)) - parseDate(get(b, COL.INITIAL_SERVICE));
-  });
-
-  return result;
+  }).sort((a, b) =>
+    parseDate(get(a, COL.INITIAL_SERVICE)) - parseDate(get(b, COL.INITIAL_SERVICE))
+  );
 }
 
 function getBalances(jobs) {
@@ -133,6 +131,29 @@ function getBalances(jobs) {
 
 function getStorageJobs(jobs) {
   return jobs.filter(r => get(r, COL.STATUS).toLowerCase().includes('storage'));
+}
+
+// Returns storage jobs with billing due within `days` days
+function getStorageBillingDue(jobs, days) {
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const end = new Date(today);
+  end.setDate(end.getDate() + days);
+
+  const storageJobs = getStorageJobs(jobs);
+  const results = [];
+
+  for (const r of storageJobs) {
+    const svcDateStr = get(r, COL.INITIAL_SERVICE);
+    const nextBilling = nextBillingDate(svcDateStr);
+    if (!nextBilling) continue;
+    if (nextBilling >= today && nextBilling <= end) {
+      results.push({ row: r, nextBilling });
+    }
+  }
+
+  results.sort((a, b) => a.nextBilling - b.nextBilling);
+  return results;
 }
 
 function formatJob(r) {
@@ -152,6 +173,24 @@ function formatJob(r) {
   ].join(' | ');
 }
 
+function formatStorageBilling(entry) {
+  const r = entry.row;
+  const avantiStorage = stripDollar(get(r, COL.AVANTI_STORAGE));
+  const vendorStorage = stripDollar(get(r, COL.VENDOR_STORAGE));
+  const margin = avantiStorage - vendorStorage;
+  return [
+    get(r, COL.JOB),
+    get(r, COL.PHONE),
+    `${get(r, COL.FROM_STATE)}→${get(r, COL.TO_STATE)}`,
+    get(r, COL.PROVIDER),
+    `Svc started: ${get(r, COL.INITIAL_SERVICE)}`,
+    `Next bill: ${fmtDate(entry.nextBilling)}`,
+    `Charge: $${avantiStorage.toLocaleString()} | Vendor cost: $${vendorStorage.toLocaleString()} | Margin: $${margin.toFixed(2)}`,
+    get(r, COL.STATUS),
+    get(r, COL.NOTES) ? `Notes: ${get(r, COL.NOTES)}` : ''
+  ].filter(Boolean).join(' | ');
+}
+
 async function askClaude(question, context) {
   const today = new Date().toLocaleDateString('en-US', {
     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
@@ -167,7 +206,7 @@ async function askClaude(question, context) {
     body: JSON.stringify({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 800,
-      system: `You are Avanti Ops, internal ops assistant for Avanti Freight Solutions. Today: ${today}. Be concise, direct, no fluff. Format as clean lists. Under 250 words.`,
+      system: `You are Avanti Ops, internal ops assistant for Avanti Freight Solutions. Today: ${today}. Be concise, direct, no fluff. Format as clean lists. Under 300 words.`,
       messages: [{ role: 'user', content: `Question: ${question}\n\nData:\n${context}` }]
     })
   });
@@ -182,6 +221,7 @@ async function askClaude(question, context) {
 
 function detectIntent(text) {
   const t = text.toLowerCase();
+  if (t.match(/storage.*(bill|due|charge|payment|billing)|bill.*storage|who.*storage.*bill|storage.*this week/)) return 'storage_billing';
   if (t.match(/servic|drop.?off|pickup|this week|next \d+ days?|upcoming|getting a container|getting a trailer|being service/)) return 'upcoming';
   if (t.match(/balanc|owed|outstanding|due|unpaid/)) return 'balances';
   if (t.match(/storag/)) return 'storage';
@@ -210,7 +250,7 @@ app.post('/webhook', async (req, res) => {
     const text = msg.text.trim();
 
     if (text === '/start') {
-      await sendTelegram(chatId, `Avanti Ops is online.\n\nTry:\n- Who is getting serviced this week?\n- Who has outstanding balances?\n- Who is in storage?\n- Daily summary`);
+      await sendTelegram(chatId, `Avanti Ops is online.\n\nTry:\n- Who is getting serviced this week?\n- Who has outstanding balances?\n- Who needs storage billing this week?\n- Who is in storage?\n- Daily summary`);
       return;
     }
 
@@ -229,21 +269,37 @@ app.post('/webhook', async (req, res) => {
       context = upcoming.length > 0
         ? `${upcoming.length} jobs with Initial Service Date from ${todayStr} to ${endStr}:\n\n${upcoming.map(formatJob).join('\n')}`
         : `No jobs found with Initial Service Date between ${todayStr} and ${endStr}.`;
+
+    } else if (intent === 'storage_billing') {
+      const daysMatch = text.match(/(\d+)\s*days?/);
+      const days = daysMatch ? parseInt(daysMatch[1]) : 7;
+      const due = getStorageBillingDue(jobs, days);
+      const todayStr = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+      const endDate = new Date(); endDate.setDate(endDate.getDate() + days);
+      const endStr = endDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+      context = due.length > 0
+        ? `${due.length} storage jobs with billing due between ${todayStr} and ${endStr}:\n\n${due.map(formatStorageBilling).join('\n')}`
+        : `No storage billing due between ${todayStr} and ${endStr}.`;
+
     } else if (intent === 'balances') {
       const bal = getBalances(jobs);
       context = bal.length > 0
         ? `${bal.length} jobs with outstanding balances:\n\n${bal.map(formatJob).join('\n')}`
         : 'No outstanding balances.';
+
     } else if (intent === 'storage') {
       const storage = getStorageJobs(jobs);
       context = storage.length > 0
         ? `${storage.length} storage jobs:\n\n${storage.map(formatJob).join('\n')}`
         : 'No storage jobs found.';
+
     } else if (intent === 'summary') {
       const upcoming = getUpcomingJobs(jobs, 7);
       const balances = getBalances(jobs);
+      const storageBilling = getStorageBillingDue(jobs, 7);
       const storage = getStorageJobs(jobs);
-      context = `SUMMARY\n\nUpcoming (7 days): ${upcoming.length}\n${upcoming.map(formatJob).join('\n')}\n\nOutstanding balances: ${balances.length}\n${balances.map(formatJob).join('\n')}\n\nIn storage: ${storage.length}\n${storage.map(formatJob).join('\n')}`;
+      context = `DAILY SUMMARY\n\nUpcoming service (7 days): ${upcoming.length}\n${upcoming.map(formatJob).join('\n')}\n\nStorage billing due (7 days): ${storageBilling.length}\n${storageBilling.map(formatStorageBilling).join('\n')}\n\nOutstanding balances: ${balances.length}\n${balances.map(formatJob).join('\n')}\n\nAll storage jobs: ${storage.length}\n${storage.map(formatJob).join('\n')}`;
+
     } else {
       context = `All ${jobs.length} jobs:\n\n${jobs.map(formatJob).join('\n')}`;
     }
