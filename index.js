@@ -140,7 +140,12 @@ function getStorageBillingDue(jobs, days) {
   const end = new Date(today);
   end.setDate(end.getDate() + days);
 
-  const storageJobs = getStorageJobs(jobs);
+  // Exclude only Completed, Cancelled, and Future Orders — all other active jobs bill every 30 days
+  const excludedStatuses = ["completed", "cancelled", "future order"];
+  const storageJobs = jobs.filter(r => {
+    const status = get(r, COL.STATUS).toLowerCase();
+    return !excludedStatuses.some(s => status.includes(s));
+  });
   const results = [];
 
   for (const r of storageJobs) {
