@@ -10,6 +10,41 @@ const GOOGLE_KEY = process.env.GOOGLE_API_KEY;
 const SHEET_ID = '1fDdMfqzat1XGbbc9G3bbI1x9QN-gFM3Udc-nUAtT3QM';
 const SHEET_NAME = 'Booked Jobs';
 
+// Column indices (0-based) — matches your sheet exactly
+// A=0: Job #, B=1: Vendor Order #, C=2: Phone, D=3: Email
+// E=4: Booked Date, F=5: Initial Service, G=6: Order Status
+// H=7: From State, I=8: To State, J=9: Service Provider
+// K=10: Total Vendor Cost, L=11: Vendor Storage, M=12: Avanti Storage
+// N=13: Sold Price, O=14: Avanti Margin, P=15: Avanti Margin %
+// Q=16: Deposit Amount, R=17: Deposit Collected, S=18: Payment Method
+// T=19: Remaining Balance, U=20: Remaining Balance Bill Date
+// V=21: Remaining Balance Payment Method, W=22: Notes
+const COL = {
+  JOB: 0,
+  VENDOR_ORDER: 1,
+  PHONE: 2,
+  EMAIL: 3,
+  BOOKED_DATE: 4,
+  INITIAL_SERVICE: 5,
+  STATUS: 6,
+  FROM_STATE: 7,
+  TO_STATE: 8,
+  PROVIDER: 9,
+  VENDOR_COST: 10,
+  VENDOR_STORAGE: 11,
+  AVANTI_STORAGE: 12,
+  SELL_PRICE: 13,
+  MARGIN: 14,
+  MARGIN_PCT: 15,
+  DEPOSIT_AMT: 16,
+  DEPOSIT_DATE: 17,
+  PAYMENT_METHOD: 18,
+  BALANCE: 19,
+  BALANCE_DATE: 20,
+  BALANCE_PAYMENT: 21,
+  NOTES: 22
+};
+
 function parseDate(str) {
   if (!str || str.trim() === '') return null;
   str = str.trim();
@@ -23,7 +58,11 @@ function parseDate(str) {
 
 function stripDollar(str) {
   if (!str) return 0;
-  return parseFloat(str.replace(/[$,\s]/g, '')) || 0;
+  return parseFloat(str.toString().replace(/[$,\s]/g, '')) || 0;
+}
+
+function get(row, col) {
+  return (row[col] || '').toString().trim();
 }
 
 async function getJobs() {
@@ -35,74 +74,82 @@ async function getJobs() {
 
   const rows = data.values;
 
-  // Find header row — look for any row where col A is 'Job #'
+  // Find header row by looking for 'Job #' in col A
   let headerIdx = -1;
   for (let i = 0; i < rows.length; i++) {
-    if (rows[i][0] && rows[i][0].toString().trim() === 'Job #') {
-      headerIdx = i;
-      break;
-    }
+    const cell = (rows[i][0] || '').toString().trim();
+    if (cell === 'Job #') { headerIdx = i; break; }
   }
-  if (headerIdx === -1) throw new Error('Could not find header row with "Job #"');
+  if (headerIdx === -1) throw new Error('Header row not found');
 
-  const headers = rows[headerIdx].map(h => (h || '').trim());
-  console.log('Headers found:', headers.join(' | '));
+  // Log actual headers so we can debug column mismatches
+  const rawHeaders = rows[headerIdx];
+  console.log('Header row index:', headerIdx);
+  rawHeaders.forEach((h, i) => {
+    const clean = (h || '').toString().replace(/\n/g, '\\n').trim();
+    console.log(`  Col ${i} (${String.fromCharCode(65+i)}): "${clean}"`);
+  });
 
   const jobs = [];
   for (let i = headerIdx + 1; i < rows.length; i++) {
     const r = rows[i];
-    if (!r[0] || !r[0].toString().trim().startsWith('A')) continue;
-    const obj = {};
-    headers.forEach((h, idx) => { obj[h] = (r[idx] || '').trim(); });
-    jobs.push(obj);
+    const jobId = get(r, COL.JOB);
+    if (!jobId || !jobId.startsWith('A')) continue;
+    jobs.push(r);
   }
 
   console.log(`Loaded ${jobs.length} jobs`);
-  return { jobs, headers };
+  // Log first few initial service dates for debugging
+  jobs.slice(0, 5).forEach(j => {
+    console.log(`  ${get(j, COL.JOB)} | svc: "${get(j, COL.INITIAL_SERVICE)}" | status: "${get(j, COL.STATUS)}"`);
+  });
+
+  return jobs;
 }
 
-function getSvcDate(job, headers) {
-  // Try exact match first, then partial match for "Initial Service"
-  const candidates = ['Initial Service', 'Initial Service Date', 'Service Date'];
-  for (const c of candidates) {
-    if (job[c] !== undefined) return job[c];
-  }
-  // fallback: find any header containing "service" (case-insensitive)
-  const key = headers.find(h => h.toLowerCase().includes('service') && h.toLowerCase().includes('initial'));
-  return key ? job[key] : '';
-}
-
-function getUpcomingJobs(jobs, headers, days) {
+function getUpcomingJobs(jobs, days) {
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const end = new Date(today);
   end.setDate(end.getDate() + days);
 
-  return jobs.filter(j => {
-    const raw = getSvcDate(j, headers);
+  const result = jobs.filter(r => {
+    const raw = get(r, COL.INITIAL_SERVICE);
     const d = parseDate(raw);
     if (!d) return false;
     return d >= today && d <= end;
-  }).sort((a, b) => {
-    return parseDate(getSvcDate(a, headers)) - parseDate(getSvcDate(b, headers));
   });
+
+  result.sort((a, b) => {
+    return parseDate(get(a, COL.INITIAL_SERVICE)) - parseDate(get(b, COL.INITIAL_SERVICE));
+  });
+
+  return result;
 }
 
 function getBalances(jobs) {
-  return jobs.filter(j => stripDollar(j['Remaining Balance']) > 0);
+  return jobs.filter(r => stripDollar(get(r, COL.BALANCE)) > 0);
 }
 
 function getStorageJobs(jobs) {
-  return jobs.filter(j => (j['Order Status'] || '').toLowerCase().includes('storage'));
+  return jobs.filter(r => get(r, COL.STATUS).toLowerCase().includes('storage'));
 }
 
-function formatJob(j, headers) {
-  const bal = stripDollar(j['Remaining Balance']);
-  const balStr = bal > 0 ? ` | $${bal.toLocaleString()} due ${j['Remaining Balance Bill Date']}` : ' | Paid in full';
-  const svcDate = getSvcDate(j, headers) || 'TBD';
-  const phone = j[''] || '';
-  const col3 = headers[2] ? j[headers[2]] : '';
-  return `${j['Job #']} | ${col3} | ${j['From State']}→${j['To State']} | ${j['Service Provider']} | Svc: ${svcDate}${balStr} | ${j['Order Status']}`;
+function formatJob(r) {
+  const bal = stripDollar(get(r, COL.BALANCE));
+  const balStr = bal > 0
+    ? `$${bal.toLocaleString()} due ${get(r, COL.BALANCE_DATE)}`
+    : 'Paid in full';
+  return [
+    get(r, COL.JOB),
+    get(r, COL.PHONE),
+    `${get(r, COL.FROM_STATE)}→${get(r, COL.TO_STATE)}`,
+    get(r, COL.PROVIDER),
+    `Svc: ${get(r, COL.INITIAL_SERVICE)}`,
+    `Sell: $${stripDollar(get(r, COL.SELL_PRICE)).toLocaleString()}`,
+    balStr,
+    get(r, COL.STATUS)
+  ].join(' | ');
 }
 
 async function askClaude(question, context) {
@@ -120,11 +167,8 @@ async function askClaude(question, context) {
     body: JSON.stringify({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 800,
-      system: `You are Avanti Ops, internal assistant for Avanti Freight Solutions. Today: ${today}. Be concise, direct, no fluff. Format as clean lists. Under 250 words.`,
-      messages: [{
-        role: 'user',
-        content: `Question: ${question}\n\nData:\n${context}`
-      }]
+      system: `You are Avanti Ops, internal ops assistant for Avanti Freight Solutions. Today: ${today}. Be concise, direct, no fluff. Format as clean lists. Under 250 words.`,
+      messages: [{ role: 'user', content: `Question: ${question}\n\nData:\n${context}` }]
     })
   });
 
@@ -171,37 +215,37 @@ app.post('/webhook', async (req, res) => {
     }
 
     await sendTelegram(chatId, 'Pulling sheet data...');
-    const { jobs, headers } = await getJobs();
+    const jobs = await getJobs();
     const intent = detectIntent(text);
     let context = '';
 
     if (intent === 'upcoming') {
       const daysMatch = text.match(/(\d+)\s*days?/);
       const days = daysMatch ? parseInt(daysMatch[1]) : 7;
-      const upcoming = getUpcomingJobs(jobs, headers, days);
+      const upcoming = getUpcomingJobs(jobs, days);
       const todayStr = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
       const endDate = new Date(); endDate.setDate(endDate.getDate() + days);
       const endStr = endDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
       context = upcoming.length > 0
-        ? `${upcoming.length} jobs with Initial Service Date from ${todayStr} to ${endStr}:\n${upcoming.map(j => formatJob(j, headers)).join('\n')}`
+        ? `${upcoming.length} jobs with Initial Service Date from ${todayStr} to ${endStr}:\n\n${upcoming.map(formatJob).join('\n')}`
         : `No jobs found with Initial Service Date between ${todayStr} and ${endStr}.`;
     } else if (intent === 'balances') {
       const bal = getBalances(jobs);
       context = bal.length > 0
-        ? `${bal.length} jobs with outstanding balances:\n${bal.map(j => formatJob(j, headers)).join('\n')}`
+        ? `${bal.length} jobs with outstanding balances:\n\n${bal.map(formatJob).join('\n')}`
         : 'No outstanding balances.';
     } else if (intent === 'storage') {
       const storage = getStorageJobs(jobs);
       context = storage.length > 0
-        ? `${storage.length} storage jobs:\n${storage.map(j => formatJob(j, headers)).join('\n')}`
+        ? `${storage.length} storage jobs:\n\n${storage.map(formatJob).join('\n')}`
         : 'No storage jobs found.';
     } else if (intent === 'summary') {
-      const upcoming = getUpcomingJobs(jobs, headers, 7);
+      const upcoming = getUpcomingJobs(jobs, 7);
       const balances = getBalances(jobs);
       const storage = getStorageJobs(jobs);
-      context = `SUMMARY\nUpcoming (7 days): ${upcoming.length} jobs\n${upcoming.map(j => formatJob(j, headers)).join('\n')}\n\nOutstanding balances: ${balances.length}\n${balances.map(j => formatJob(j, headers)).join('\n')}\n\nIn storage: ${storage.length}\n${storage.map(j => formatJob(j, headers)).join('\n')}`;
+      context = `SUMMARY\n\nUpcoming (7 days): ${upcoming.length}\n${upcoming.map(formatJob).join('\n')}\n\nOutstanding balances: ${balances.length}\n${balances.map(formatJob).join('\n')}\n\nIn storage: ${storage.length}\n${storage.map(formatJob).join('\n')}`;
     } else {
-      context = `All jobs (${jobs.length} total):\n${jobs.map(j => formatJob(j, headers)).join('\n')}`;
+      context = `All ${jobs.length} jobs:\n\n${jobs.map(formatJob).join('\n')}`;
     }
 
     const answer = await askClaude(text, context);
