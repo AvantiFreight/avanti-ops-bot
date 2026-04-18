@@ -32,7 +32,7 @@ async function askClaude(question, sheetData) {
       'anthropic-version': '2023-06-01'
     },
     body: JSON.stringify({
-      model: 'claude-sonnet-4-5-20251022',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 1000,
       system: `You are Avanti Ops, an internal operations assistant for Avanti Freight Solutions — a self-service moving brokerage. Answer questions about active jobs based on live Google Sheet data.
 
