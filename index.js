@@ -4,37 +4,42 @@ const fetch = require('node-fetch');
 const app = express();
 app.use(express.json());
 
-const TELEGRAM_TOKEN = '8738052440:AAFTYZmBLYQa6k8AB7dKrZ1bOscheghlrdI';
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const GOOGLE_KEY = process.env.GOOGLE_API_KEY;
 const SHEET_ID = '1fDdMfqzat1XGbbc9G3bbI1x9QN-gFM3Udc-nUAtT3QM';
 const SHEET_NAME = 'Booked Jobs';
 
-// Column indices (0-based)
+if (!TELEGRAM_TOKEN) {
+  console.error('FATAL: TELEGRAM_TOKEN env var not set. Add it on Render and redeploy.');
+  process.exit(1);
+}
+if (!ANTHROPIC_KEY) console.warn('WARN: ANTHROPIC_API_KEY not set');
+if (!GOOGLE_KEY) console.warn('WARN: GOOGLE_API_KEY not set');
+
+// Column indices (0-based) — matches sheet exactly
 const COL = {
-  JOB: 0,
-  VENDOR_ORDER: 1,
-  PHONE: 2,
-  EMAIL: 3,
-  BOOKED_DATE: 4,
-  INITIAL_SERVICE: 5,
-  STATUS: 6,
-  FROM_STATE: 7,
-  TO_STATE: 8,
-  PROVIDER: 9,
-  VENDOR_COST: 10,
-  VENDOR_STORAGE: 11,
-  AVANTI_STORAGE: 12,
-  SELL_PRICE: 13,
-  MARGIN: 14,
-  MARGIN_PCT: 15,
-  DEPOSIT_AMT: 16,
-  DEPOSIT_DATE: 17,
-  PAYMENT_METHOD: 18,
-  BALANCE: 19,
-  BALANCE_DATE: 20,
-  BALANCE_PAYMENT: 21,
-  NOTES: 22
+  JOB: 0, VENDOR_ORDER: 1, PHONE: 2, EMAIL: 3, BOOKED_DATE: 4,
+  INITIAL_SERVICE: 5, STATUS: 6, FROM_STATE: 7, TO_STATE: 8, PROVIDER: 9,
+  VENDOR_COST: 10, VENDOR_STORAGE: 11, AVANTI_STORAGE: 12, SELL_PRICE: 13,
+  MARGIN: 14, MARGIN_PCT: 15, DEPOSIT_AMT: 16, DEPOSIT_DATE: 17,
+  PAYMENT_METHOD: 18, BALANCE: 19, BALANCE_DATE: 20, BALANCE_PAYMENT: 21, NOTES: 22
+};
+
+// Diagnostic state — populated on every getJobs() call, surfaced by /debug
+const diag = {
+  lastSheetPull: null,
+  lastSheetStatus: 'never pulled',
+  lastSheetError: null,
+  lastHttpStatus: null,
+  headerIdx: null,
+  totalRows: null,
+  firstColAValues: [],
+  rawHeaders: [],
+  jobsLoaded: null,
+  cacheHits: 0,
+  cacheMisses: 0,
+  bootedAt: new Date()
 };
 
 function parseDate(str) {
@@ -52,6 +57,11 @@ function fmtDate(d) {
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
+function fmtTimestamp(d) {
+  if (!d) return 'never';
+  return d.toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+}
+
 function stripDollar(str) {
   if (!str) return 0;
   return parseFloat(str.toString().replace(/[$,\s]/g, '')) || 0;
@@ -61,24 +71,61 @@ function get(row, col) {
   return (row[col] || '').toString().trim();
 }
 
-async function getJobs() {
-  const range = encodeURIComponent(SHEET_NAME + '!A:W');
-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${range}?key=${GOOGLE_KEY}`;
-  const res = await fetch(url);
-  const data = await res.json();
-  if (!data.values) throw new Error('No sheet data');
+// 60-second cache
+let jobCache = null;
+let cacheTime = 0;
+const CACHE_TTL = 60000;
 
+async function getJobs(forceRefresh = false) {
+  if (!forceRefresh && jobCache && (Date.now() - cacheTime) < CACHE_TTL) {
+    diag.cacheHits++;
+    console.log('Using cached data');
+    return jobCache;
+  }
+  diag.cacheMisses++;
+  const range = encodeURIComponent(SHEET_NAME + '!A:Z');
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${range}?key=${GOOGLE_KEY}`;
+  let res, data;
+  try {
+    res = await fetch(url);
+    diag.lastHttpStatus = res.status;
+    data = await res.json();
+  } catch (e) {
+    diag.lastSheetStatus = 'fetch failed';
+    diag.lastSheetError = e.message;
+    diag.lastSheetPull = new Date();
+    throw e;
+  }
+  if (!data.values) {
+    diag.lastSheetStatus = `Sheets API error (HTTP ${res.status})`;
+    diag.lastSheetError = JSON.stringify(data).slice(0, 500);
+    diag.lastSheetPull = new Date();
+    console.error('Google Sheets API response:', JSON.stringify(data));
+    throw new Error('No sheet data');
+  }
   const rows = data.values;
+  diag.totalRows = rows.length;
+  diag.firstColAValues = rows.slice(0, 12).map((r, i) =>
+    `[row ${i}] "${(r[0] || '').toString().replace(/\n/g, '\\n').trim()}"`
+  );
+
   let headerIdx = -1;
   for (let i = 0; i < rows.length; i++) {
     if ((rows[i][0] || '').toString().trim() === 'Job #') { headerIdx = i; break; }
   }
-  if (headerIdx === -1) throw new Error('Header row not found');
-
+  diag.headerIdx = headerIdx;
+  if (headerIdx === -1) {
+    diag.lastSheetStatus = 'header row not found';
+    diag.lastSheetPull = new Date();
+    throw new Error('Header row not found');
+  }
   const rawHeaders = rows[headerIdx];
+  diag.rawHeaders = rawHeaders.map((h, i) =>
+    `${String.fromCharCode(65 + i)}: "${(h || '').toString().replace(/\n/g, '\\n').trim()}"`
+  );
   console.log('Header row index:', headerIdx);
   rawHeaders.forEach((h, i) => {
-    console.log(`  Col ${i} (${String.fromCharCode(65+i)}): "${(h||'').toString().replace(/\n/g,'\\n').trim()}"`);
+    console.log(`  Col ${i} (${String.fromCharCode(65 + i)}): "${(h || '').toString().replace(/\n/g, '\\n').trim()}"`);
   });
 
   const jobs = [];
@@ -89,20 +136,21 @@ async function getJobs() {
     jobs.push(r);
   }
   console.log(`Loaded ${jobs.length} jobs`);
+  diag.jobsLoaded = jobs.length;
+  diag.lastSheetStatus = 'OK';
+  diag.lastSheetError = null;
+  diag.lastSheetPull = new Date();
+  jobCache = jobs;
+  cacheTime = Date.now();
   return jobs;
 }
 
-// Calculate next storage billing date: initial service date + N*30 days
-// Returns the next upcoming billing date on or after today
 function nextBillingDate(svcDateStr) {
   const svcDate = parseDate(svcDateStr);
   if (!svcDate) return null;
-
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-
   let billing = new Date(svcDate);
-  // Add 30 days at a time until we reach today or future
   while (billing < today) {
     billing = new Date(billing);
     billing.setDate(billing.getDate() + 30);
@@ -115,7 +163,6 @@ function getUpcomingJobs(jobs, days) {
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const end = new Date(today);
   end.setDate(end.getDate() + days);
-
   return jobs.filter(r => {
     const d = parseDate(get(r, COL.INITIAL_SERVICE));
     if (!d) return false;
@@ -133,22 +180,18 @@ function getStorageJobs(jobs) {
   return jobs.filter(r => get(r, COL.STATUS).toLowerCase().includes('storage'));
 }
 
-// Returns storage jobs with billing due within `days` days
 function getStorageBillingDue(jobs, days) {
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const end = new Date(today);
   end.setDate(end.getDate() + days);
-
-  // Exclude only Completed, Cancelled, and Future Orders — all other active jobs bill every 30 days
-  const excludedStatuses = ["completed", "cancelled", "future order"];
-  const storageJobs = jobs.filter(r => {
+  const excludedStatuses = ['completed', 'cancelled', 'future order'];
+  const activeJobs = jobs.filter(r => {
     const status = get(r, COL.STATUS).toLowerCase();
     return !excludedStatuses.some(s => status.includes(s));
   });
   const results = [];
-
-  for (const r of storageJobs) {
+  for (const r of activeJobs) {
     const svcDateStr = get(r, COL.INITIAL_SERVICE);
     const nextBilling = nextBillingDate(svcDateStr);
     if (!nextBilling) continue;
@@ -156,7 +199,6 @@ function getStorageBillingDue(jobs, days) {
       results.push({ row: r, nextBilling });
     }
   }
-
   results.sort((a, b) => a.nextBilling - b.nextBilling);
   return results;
 }
@@ -167,14 +209,11 @@ function formatJob(r) {
     ? `$${bal.toLocaleString()} due ${get(r, COL.BALANCE_DATE)}`
     : 'Paid in full';
   return [
-    get(r, COL.JOB),
-    get(r, COL.PHONE),
+    get(r, COL.JOB), get(r, COL.PHONE),
     `${get(r, COL.FROM_STATE)}→${get(r, COL.TO_STATE)}`,
-    get(r, COL.PROVIDER),
-    `Svc: ${get(r, COL.INITIAL_SERVICE)}`,
+    get(r, COL.PROVIDER), `Svc: ${get(r, COL.INITIAL_SERVICE)}`,
     `Sell: $${stripDollar(get(r, COL.SELL_PRICE)).toLocaleString()}`,
-    balStr,
-    get(r, COL.STATUS)
+    balStr, get(r, COL.STATUS)
   ].join(' | ');
 }
 
@@ -184,11 +223,9 @@ function formatStorageBilling(entry) {
   const vendorStorage = stripDollar(get(r, COL.VENDOR_STORAGE));
   const margin = avantiStorage - vendorStorage;
   return [
-    get(r, COL.JOB),
-    get(r, COL.PHONE),
+    get(r, COL.JOB), get(r, COL.PHONE),
     `${get(r, COL.FROM_STATE)}→${get(r, COL.TO_STATE)}`,
-    get(r, COL.PROVIDER),
-    `Svc started: ${get(r, COL.INITIAL_SERVICE)}`,
+    get(r, COL.PROVIDER), `Svc started: ${get(r, COL.INITIAL_SERVICE)}`,
     `Next bill: ${fmtDate(entry.nextBilling)}`,
     `Charge: $${avantiStorage.toLocaleString()} | Vendor cost: $${vendorStorage.toLocaleString()} | Margin: $${margin.toFixed(2)}`,
     get(r, COL.STATUS),
@@ -200,7 +237,6 @@ async function askClaude(question, context) {
   const today = new Date().toLocaleDateString('en-US', {
     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
   });
-
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -213,11 +249,10 @@ async function askClaude(question, context) {
       max_tokens: 800,
       system: `You are Avanti Ops, internal ops assistant for Avanti Freight Solutions. Today: ${today}. Be concise, direct, no fluff. Format as clean lists. Under 300 words.
 
-CRITICAL STORAGE BILLING RULE: When reporting storage billing, NEVER filter or exclude jobs based on payment status. "Paid in full" only covers the initial 30-day rental period and transportation — it does NOT cover any subsequent 30-day storage cycles. Every active job past its initial service date is subject to recurring monthly storage charges regardless of whether the original invoice was paid in full. Always list every job flagged by the billing calculation.`,
+CRITICAL STORAGE BILLING RULE: "Paid in full" only covers the initial 30-day rental period and transportation. It does NOT cover subsequent 30-day cycles. Every active job is subject to recurring monthly storage charges regardless of payment status. Always list every flagged job.`,
       messages: [{ role: 'user', content: `Question: ${question}\n\nData:\n${context}` }]
     })
   });
-
   const data = await res.json();
   if (data.error) {
     console.error('Claude API error:', JSON.stringify(data.error));
@@ -228,8 +263,8 @@ CRITICAL STORAGE BILLING RULE: When reporting storage billing, NEVER filter or e
 
 function detectIntent(text) {
   const t = text.toLowerCase();
-  if (t.match(/storage.*(bill|due|charge|payment|billing)|bill.*storage|who.*storage.*bill|storage.*this week/)) return 'storage_billing';
-  if (t.match(/servic|drop.?off|pickup|this week|next \d+ days?|upcoming|getting a container|getting a trailer|being service/)) return 'upcoming';
+  if (t.match(/storage.*(bill|due|charge|payment|billing)|bill.*storage|who.*storage.*bill|storage.*this week|monthly rental/)) return 'storage_billing';
+  if (t.match(/servic|drop.?off|pickup|this week|next \d+ days?|upcoming|getting a container|getting a trailer|being service|initial deliver/)) return 'upcoming';
   if (t.match(/balanc|owed|outstanding|due|unpaid/)) return 'balances';
   if (t.match(/storag/)) return 'storage';
   if (t.match(/summar|daily|today/)) return 'summary';
@@ -248,6 +283,48 @@ async function sendTelegram(chatId, text) {
   }
 }
 
+async function buildDebugReport() {
+  // Force a fresh pull so the report reflects the live sheet, not cached state
+  let pullError = null;
+  try {
+    await getJobs(true);
+  } catch (e) {
+    pullError = e.message;
+  }
+  const lines = [];
+  lines.push('=== AVANTI OPS BOT — DEBUG ===');
+  lines.push('');
+  lines.push(`Booted at:        ${fmtTimestamp(diag.bootedAt)}`);
+  lines.push(`Now:              ${fmtTimestamp(new Date())}`);
+  lines.push('');
+  lines.push('--- ENV ---');
+  lines.push(`TELEGRAM_TOKEN:   ${TELEGRAM_TOKEN ? 'set (env)' : 'MISSING'}`);
+  lines.push(`ANTHROPIC_API_KEY:${ANTHROPIC_KEY ? ' set' : ' MISSING'}`);
+  lines.push(`GOOGLE_API_KEY:   ${GOOGLE_KEY ? 'set' : 'MISSING'}`);
+  lines.push('');
+  lines.push('--- SHEET ---');
+  lines.push(`Sheet ID:         ${SHEET_ID}`);
+  lines.push(`Sheet tab:        ${SHEET_NAME}`);
+  lines.push(`Last pull:        ${fmtTimestamp(diag.lastSheetPull)}`);
+  lines.push(`Last HTTP status: ${diag.lastHttpStatus ?? 'n/a'}`);
+  lines.push(`Last status:      ${diag.lastSheetStatus}`);
+  if (diag.lastSheetError) lines.push(`Last error:       ${diag.lastSheetError}`);
+  if (pullError) lines.push(`This pull error:  ${pullError}`);
+  lines.push('');
+  lines.push('--- LOAD ---');
+  lines.push(`Total rows from Sheets API: ${diag.totalRows ?? 'n/a'}`);
+  lines.push(`Header row index detected:  ${diag.headerIdx ?? 'n/a'}  (0-based; sheet row 4 = index 3)`);
+  lines.push(`Jobs loaded (col A "A..."): ${diag.jobsLoaded ?? 'n/a'}`);
+  lines.push(`Cache hits / misses:        ${diag.cacheHits} / ${diag.cacheMisses}`);
+  lines.push('');
+  lines.push('--- FIRST 12 ROWS, COLUMN A ---');
+  diag.firstColAValues.forEach(line => lines.push('  ' + line));
+  lines.push('');
+  lines.push('--- DETECTED HEADER ROW ---');
+  diag.rawHeaders.slice(0, 24).forEach(line => lines.push('  ' + line));
+  return lines.join('\n');
+}
+
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
   try {
@@ -257,7 +334,37 @@ app.post('/webhook', async (req, res) => {
     const text = msg.text.trim();
 
     if (text === '/start') {
-      await sendTelegram(chatId, `Avanti Ops is online.\n\nTry:\n- Who is getting serviced this week?\n- Who has outstanding balances?\n- Who needs storage billing this week?\n- Who is in storage?\n- Daily summary`);
+      await sendTelegram(chatId,
+        `Avanti Ops is online.\n\n` +
+        `Try:\n` +
+        `- Who is getting serviced this week?\n` +
+        `- Who has outstanding balances?\n` +
+        `- Who needs storage billing this week?\n` +
+        `- Who is in storage?\n` +
+        `- Daily summary\n\n` +
+        `Diagnostics:\n` +
+        `- /debug — sheet pull diagnostics\n` +
+        `- /myid  — show your Telegram chat ID`
+      );
+      return;
+    }
+
+    if (text === '/myid') {
+      const username = msg.from?.username ? '@' + msg.from.username : 'n/a';
+      const name = `${msg.from?.first_name || ''} ${msg.from?.last_name || ''}`.trim() || 'n/a';
+      await sendTelegram(chatId,
+        `Telegram chat ID: ${chatId}\n` +
+        `Username:         ${username}\n` +
+        `Name:             ${name}\n\n` +
+        `Send the chat ID above to wire up morning auto-summary.`
+      );
+      return;
+    }
+
+    if (text === '/debug') {
+      await sendTelegram(chatId, 'Running diagnostics...');
+      const report = await buildDebugReport();
+      await sendTelegram(chatId, report);
       return;
     }
 
@@ -285,7 +392,7 @@ app.post('/webhook', async (req, res) => {
       const endDate = new Date(); endDate.setDate(endDate.getDate() + days);
       const endStr = endDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
       context = due.length > 0
-        ? `${due.length} storage jobs with billing due between ${todayStr} and ${endStr}:\n\n${due.map(formatStorageBilling).join('\n')}`
+        ? `${due.length} jobs with storage billing due between ${todayStr} and ${endStr}:\n\n${due.map(formatStorageBilling).join('\n')}`
         : `No storage billing due between ${todayStr} and ${endStr}.`;
 
     } else if (intent === 'balances') {
