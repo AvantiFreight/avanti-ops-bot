@@ -1,5 +1,6 @@
 const express = require('express');
 const fetch = require('node-fetch');
+const cron = require('node-cron');
 
 const app = express();
 app.use(express.json());
@@ -25,6 +26,15 @@ if (ALLOWED_CHAT_IDS.length === 0) {
   console.error('FATAL: ALLOWED_CHAT_IDS env var not set. Add a comma-separated list of authorized Telegram chat IDs.');
   process.exit(1);
 }
+
+// Morning brief configuration (cron pattern, IANA timezone, comma-separated chat IDs).
+// All optional; defaults to 8AM America/New_York to every chat in ALLOWED_CHAT_IDS.
+const BRIEF_CRON = process.env.BRIEF_CRON || '0 8 * * *';
+const BRIEF_TIMEZONE = process.env.BRIEF_TIMEZONE || 'America/New_York';
+const BRIEF_CHAT_IDS = (process.env.BRIEF_CHAT_IDS || ALLOWED_CHAT_IDS.join(','))
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
 // Column indices (0-based) — matches sheet exactly
 const COL = {
@@ -438,6 +448,87 @@ function formatHowMany(stats, jobs) {
   return lines.join('\n');
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Morning brief — composed in pure JS, no LLM call (deterministic, never fails on AI)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function buildMorningBrief() {
+  const jobs = await getJobs(true);
+  const upcoming = getUpcomingJobs(jobs, 7);
+  const billing3day = getStorageBillingDue(jobs, 3);
+  const allBalances = getBalances(jobs);
+  const balances2day = allBalances.filter(r => {
+    const d = parseDate(get(r, COL.BALANCE_DATE));
+    if (!d) return false;
+    const today = new Date();
+    const t0 = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    const t2 = new Date(t0); t2.setDate(t2.getDate() + 2);
+    return d >= t0 && d <= t2;
+  });
+
+  const dateStr = new Date().toLocaleDateString('en-US', {
+    weekday: 'long', month: 'long', day: 'numeric', year: 'numeric',
+    timeZone: BRIEF_TIMEZONE
+  });
+
+  const lines = [];
+  lines.push(`AVANTI MORNING BRIEF — ${dateStr}`);
+  lines.push('='.repeat(54));
+  lines.push('');
+
+  if (billing3day.length > 0) {
+    lines.push(`STORAGE BILLING — DUE IN NEXT 3 DAYS (${billing3day.length})`);
+    billing3day.forEach(e => lines.push('  ' + formatStorageBilling(e)));
+    lines.push('');
+  }
+
+  if (balances2day.length > 0) {
+    lines.push(`CUSTOMER BALANCES — DUE IN NEXT 2 DAYS (${balances2day.length})`);
+    balances2day.forEach(r => lines.push('  ' + formatJob(r)));
+    lines.push('');
+  }
+
+  lines.push(`SERVICE DROPS — NEXT 7 DAYS (${upcoming.length})`);
+  if (upcoming.length === 0) {
+    lines.push('  None scheduled');
+  } else {
+    upcoming.forEach(r => lines.push('  ' + formatJob(r)));
+  }
+  lines.push('');
+
+  lines.push(`OPEN BALANCES — TOTAL ${allBalances.length}`);
+  if (allBalances.length === 0) {
+    lines.push('  None');
+  } else {
+    allBalances.forEach(r => lines.push('  ' + formatJob(r)));
+  }
+
+  if (billing3day.length === 0 && balances2day.length === 0 && upcoming.length === 0 && allBalances.length === 0) {
+    lines.push('');
+    lines.push('Nothing on deck. Quiet day.');
+  }
+
+  return lines.join('\n');
+}
+
+async function fireMorningBrief(reason) {
+  console.log(`Firing morning brief (${reason}) to ${BRIEF_CHAT_IDS.length} chat(s)`);
+  let brief;
+  try {
+    brief = await buildMorningBrief();
+  } catch (e) {
+    console.error('buildMorningBrief failed:', e.message);
+    brief = `MORNING BRIEF FAILED: ${e.message}\n\nCheck /debug.`;
+  }
+  for (const chatId of BRIEF_CHAT_IDS) {
+    try {
+      await sendTelegram(chatId, brief);
+    } catch (e) {
+      console.error(`Failed to send brief to ${chatId}:`, e.message);
+    }
+  }
+}
+
 function describeFilters(vendor, state) {
   const parts = [];
   if (vendor) parts.push(`vendor=${vendor}`);
@@ -624,8 +715,11 @@ app.post('/webhook', async (req, res) => {
         `/balances        — open customer balances\n` +
         `/active          — all active (billable) jobs\n` +
         `/howmany         — counts, revenue, margin scoreboard\n` +
+        `/testbrief       — fire the 8AM morning brief now (test)\n` +
         `/debug           — sheet diagnostics\n` +
         `/myid            — your Telegram chat ID\n\n` +
+        `AUTO BRIEF\n` +
+        `Daily ${BRIEF_CRON} (${BRIEF_TIMEZONE}) → ${BRIEF_CHAT_IDS.length} chat(s)\n\n` +
         `FILTERS — add a vendor or state to any query\n` +
         `  /billing PODS        — only PODS billing this week\n` +
         `  /upcoming Florida    — only FL service drops this week\n` +
@@ -640,6 +734,12 @@ app.post('/webhook', async (req, res) => {
       await sendTelegram(chatId, 'Running diagnostics...');
       const report = await buildDebugReport();
       await sendTelegram(chatId, report);
+      return;
+    }
+
+    if (text === '/testbrief') {
+      await sendTelegram(chatId, 'Building morning brief...');
+      await fireMorningBrief('manual /testbrief');
       return;
     }
 
@@ -721,4 +821,13 @@ app.post('/webhook', async (req, res) => {
 app.get('/', (req, res) => res.send('Avanti Ops bot is running.'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  // Schedule the morning brief. Validate the cron pattern up front so a typo fails loud.
+  if (!cron.validate(BRIEF_CRON)) {
+    console.error(`FATAL: BRIEF_CRON "${BRIEF_CRON}" is not a valid cron expression. Bot is up but morning brief is disabled.`);
+    return;
+  }
+  cron.schedule(BRIEF_CRON, () => fireMorningBrief(`scheduled cron ${BRIEF_CRON} ${BRIEF_TIMEZONE}`), { timezone: BRIEF_TIMEZONE });
+  console.log(`Morning brief scheduled: cron="${BRIEF_CRON}" tz="${BRIEF_TIMEZONE}" → chats=[${BRIEF_CHAT_IDS.join(', ')}]`);
+});
