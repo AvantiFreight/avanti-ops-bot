@@ -297,6 +297,214 @@ function getActiveJobs(jobs) {
   return jobs.filter(isActive);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Anomaly detection — daily revenue protection
+// ─────────────────────────────────────────────────────────────────────────────
+
+const NO_STORAGE_NOTE_PATTERNS = ['no storage', 'no extra storage', 'without storage', 'direct move', 'pickup directly'];
+
+function notesIndicateNoStorage(row) {
+  const notes = get(row, COL.NOTES).toLowerCase();
+  if (!notes) return false;
+  return NO_STORAGE_NOTE_PATTERNS.some(p => notes.includes(p));
+}
+
+function getFlags(jobs) {
+  const flags = {
+    cancelledWithBalance: [],
+    completedWithBalance: [],
+    statusNotesContradiction: [],
+    activeOldNoStorage: [],
+    negativeMargin: [],
+    skinnyMargin: [],
+    duplicateVendorOrder: [],
+    missingInitialService: []
+  };
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const t30 = new Date(today); t30.setDate(t30.getDate() - 30);
+
+  // 1 & 2: cancelled / completed jobs with open balance
+  for (const r of jobs) {
+    const status = get(r, COL.STATUS).toLowerCase();
+    const bal = stripDollar(get(r, COL.BALANCE));
+    if (bal <= 0) continue;
+    if (status.includes('cancelled')) flags.cancelledWithBalance.push({ row: r, balance: bal });
+    else if (status.includes('completed')) flags.completedWithBalance.push({ row: r, balance: bal });
+  }
+
+  // 3: status / notes contradictions
+  for (const r of jobs) {
+    const status = get(r, COL.STATUS).toLowerCase();
+    if (status.includes('storage') && notesIndicateNoStorage(r)) {
+      flags.statusNotesContradiction.push({ row: r, reason: 'Status says storage, notes say no storage / direct move' });
+    }
+    if (status.includes('future order')) {
+      const svc = parseDate(get(r, COL.INITIAL_SERVICE));
+      if (svc && svc < today) {
+        flags.statusNotesContradiction.push({ row: r, reason: `Status "Future Order" but service date ${get(r, COL.INITIAL_SERVICE)} has passed` });
+      }
+    }
+    if (status.includes('completed')) {
+      const svc = parseDate(get(r, COL.INITIAL_SERVICE));
+      if (svc && svc > today) {
+        flags.statusNotesContradiction.push({ row: r, reason: `Status "Completed" but service date ${get(r, COL.INITIAL_SERVICE)} is in the future` });
+      }
+    }
+  }
+
+  // 4: active 30+ days out, Avanti Storage charge is empty/zero, notes don't say no-storage
+  for (const r of jobs) {
+    if (!isActive(r)) continue;
+    const svc = parseDate(get(r, COL.INITIAL_SERVICE));
+    if (!svc || svc > t30) continue;
+    if (stripDollar(get(r, COL.AVANTI_STORAGE)) > 0) continue;
+    if (notesIndicateNoStorage(r)) continue;
+    const daysOut = Math.floor((today - svc) / 86400000);
+    flags.activeOldNoStorage.push({ row: r, daysOut });
+  }
+
+  // 5: margin issues (skip cancelled — irrelevant)
+  for (const r of jobs) {
+    if (get(r, COL.STATUS).toLowerCase().includes('cancelled')) continue;
+    const margin = stripDollar(get(r, COL.MARGIN));
+    const sold = stripDollar(get(r, COL.SELL_PRICE));
+    if (sold === 0) continue;
+    if (margin < 0) {
+      flags.negativeMargin.push({ row: r, margin });
+    } else {
+      const pct = (margin / sold) * 100;
+      if (pct < 5) flags.skinnyMargin.push({ row: r, margin, pct });
+    }
+  }
+
+  // 6: duplicate Vendor Order # across different Job #s (multi-container with same Job # is OK)
+  const byVO = {};
+  for (const r of jobs) {
+    const vo = get(r, COL.VENDOR_ORDER);
+    if (!vo) continue;
+    (byVO[vo] = byVO[vo] || []).push(r);
+  }
+  for (const [vo, rows] of Object.entries(byVO)) {
+    if (rows.length < 2) continue;
+    const uniqueJobs = new Set(rows.map(r => get(r, COL.JOB)));
+    if (uniqueJobs.size > 1) flags.duplicateVendorOrder.push({ vendorOrder: vo, rows });
+  }
+
+  // 7: active jobs with no Initial Service Date (bot can't bill or schedule them)
+  for (const r of jobs) {
+    if (!isActive(r)) continue;
+    if (!get(r, COL.INITIAL_SERVICE)) flags.missingInitialService.push({ row: r });
+  }
+
+  return flags;
+}
+
+function flagsTotal(flags) {
+  return Object.values(flags).reduce((s, arr) => s + arr.length, 0);
+}
+
+function formatFlags(flags) {
+  const total = flagsTotal(flags);
+  if (total === 0) return 'No flags. Sheet looks clean.';
+  const lines = [];
+  lines.push(`AVANTI FLAGS — ${total} item(s) need attention`);
+  lines.push('='.repeat(54));
+  lines.push('');
+
+  if (flags.cancelledWithBalance.length) {
+    lines.push(`CANCELLED JOBS WITH OPEN BALANCE (${flags.cancelledWithBalance.length})`);
+    lines.push('  Either refund owed OR balance should be zeroed out.');
+    flags.cancelledWithBalance.forEach(({ row: r, balance }) =>
+      lines.push(`  ${get(r, COL.JOB)} | ${get(r, COL.PHONE)} | ${get(r, COL.PROVIDER)} | $${balance.toLocaleString()} sitting on Cancelled job`)
+    );
+    lines.push('');
+  }
+
+  if (flags.completedWithBalance.length) {
+    lines.push(`COMPLETED JOBS WITH OPEN BALANCE (${flags.completedWithBalance.length})`);
+    lines.push('  Uncollected revenue OR balance should be zeroed.');
+    flags.completedWithBalance.forEach(({ row: r, balance }) =>
+      lines.push(`  ${get(r, COL.JOB)} | ${get(r, COL.PHONE)} | ${get(r, COL.PROVIDER)} | $${balance.toLocaleString()} still owed`)
+    );
+    lines.push('');
+  }
+
+  if (flags.statusNotesContradiction.length) {
+    lines.push(`STATUS / NOTES CONTRADICTIONS (${flags.statusNotesContradiction.length})`);
+    flags.statusNotesContradiction.forEach(({ row: r, reason }) => {
+      lines.push(`  ${get(r, COL.JOB)} | ${reason}`);
+      const notes = get(r, COL.NOTES);
+      if (notes) lines.push(`    Notes: "${notes}"`);
+    });
+    lines.push('');
+  }
+
+  if (flags.activeOldNoStorage.length) {
+    lines.push(`ACTIVE 30+ DAYS, NO STORAGE CHARGE SET (${flags.activeOldNoStorage.length})`);
+    lines.push('  Container has been out a month+ but Avanti Storage cell is $0.');
+    lines.push('  Either missing recurring revenue or the cell needs to be filled.');
+    flags.activeOldNoStorage.forEach(({ row: r, daysOut }) =>
+      lines.push(`  ${get(r, COL.JOB)} | ${get(r, COL.PHONE)} | ${get(r, COL.PROVIDER)} | ${daysOut} days out | Status: ${get(r, COL.STATUS)}`)
+    );
+    lines.push('');
+  }
+
+  if (flags.negativeMargin.length) {
+    lines.push(`NEGATIVE MARGIN — VENDOR COST EXCEEDED SELL PRICE (${flags.negativeMargin.length})`);
+    flags.negativeMargin.forEach(({ row: r, margin }) =>
+      lines.push(`  ${get(r, COL.JOB)} | ${get(r, COL.PROVIDER)} | Sold ${fmtMoney(stripDollar(get(r, COL.SELL_PRICE)))} | Vendor cost ${fmtMoney(stripDollar(get(r, COL.VENDOR_COST)))} | Margin ${fmtMoney(margin)} | Status: ${get(r, COL.STATUS)}`)
+    );
+    lines.push('');
+  }
+
+  if (flags.skinnyMargin.length) {
+    lines.push(`SKINNY MARGIN — UNDER 5% (${flags.skinnyMargin.length})`);
+    flags.skinnyMargin.forEach(({ row: r, margin, pct }) =>
+      lines.push(`  ${get(r, COL.JOB)} | ${get(r, COL.PROVIDER)} | Sold ${fmtMoney(stripDollar(get(r, COL.SELL_PRICE)))} | Margin ${fmtMoney(margin)} (${pct.toFixed(1)}%) | Status: ${get(r, COL.STATUS)}`)
+    );
+    lines.push('');
+  }
+
+  if (flags.duplicateVendorOrder.length) {
+    lines.push(`DUPLICATE VENDOR ORDER # ACROSS DIFFERENT JOBS (${flags.duplicateVendorOrder.length})`);
+    lines.push('  Same vendor order # appears on multiple Job #s — usually a data entry error.');
+    flags.duplicateVendorOrder.forEach(({ vendorOrder, rows }) => {
+      const jobIds = [...new Set(rows.map(r => get(r, COL.JOB)))].join(', ');
+      lines.push(`  Vendor Order ${vendorOrder} → Jobs: ${jobIds}`);
+    });
+    lines.push('');
+  }
+
+  if (flags.missingInitialService.length) {
+    lines.push(`ACTIVE JOBS MISSING INITIAL SERVICE DATE (${flags.missingInitialService.length})`);
+    lines.push("  Bot can't compute storage billing without this. Fill it in.");
+    flags.missingInitialService.forEach(({ row: r }) =>
+      lines.push(`  ${get(r, COL.JOB)} | ${get(r, COL.PHONE)} | ${get(r, COL.PROVIDER)} | Status: ${get(r, COL.STATUS)}`)
+    );
+    lines.push('');
+  }
+
+  return lines.join('\n');
+}
+
+function summarizeFlagsForBrief(flags) {
+  const total = flagsTotal(flags);
+  if (total === 0) return null;
+  const lines = [];
+  lines.push(`NEEDS YOUR ATTENTION (${total} flag${total === 1 ? '' : 's'})`);
+  if (flags.cancelledWithBalance.length) lines.push(`  ${flags.cancelledWithBalance.length} cancelled job(s) with open balance`);
+  if (flags.completedWithBalance.length) lines.push(`  ${flags.completedWithBalance.length} completed job(s) with open balance`);
+  if (flags.statusNotesContradiction.length) lines.push(`  ${flags.statusNotesContradiction.length} status/notes contradiction(s)`);
+  if (flags.activeOldNoStorage.length) lines.push(`  ${flags.activeOldNoStorage.length} active job(s) 30+ days, no storage charge`);
+  if (flags.negativeMargin.length) lines.push(`  ${flags.negativeMargin.length} negative-margin job(s)`);
+  if (flags.skinnyMargin.length) lines.push(`  ${flags.skinnyMargin.length} skinny-margin job(s) (<5%)`);
+  if (flags.duplicateVendorOrder.length) lines.push(`  ${flags.duplicateVendorOrder.length} duplicate vendor order #(s)`);
+  if (flags.missingInitialService.length) lines.push(`  ${flags.missingInitialService.length} active job(s) missing service date`);
+  lines.push('  Run /flags for detail.');
+  return lines.join('\n');
+}
+
 function getStorageBillingDue(jobs, days) {
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -465,6 +673,7 @@ async function buildMorningBrief() {
     const t2 = new Date(t0); t2.setDate(t2.getDate() + 2);
     return d >= t0 && d <= t2;
   });
+  const flags = getFlags(jobs);
 
   const dateStr = new Date().toLocaleDateString('en-US', {
     weekday: 'long', month: 'long', day: 'numeric', year: 'numeric',
@@ -475,6 +684,12 @@ async function buildMorningBrief() {
   lines.push(`AVANTI MORNING BRIEF — ${dateStr}`);
   lines.push('='.repeat(54));
   lines.push('');
+
+  const flagSummary = summarizeFlagsForBrief(flags);
+  if (flagSummary) {
+    lines.push(flagSummary);
+    lines.push('');
+  }
 
   if (billing3day.length > 0) {
     lines.push(`STORAGE BILLING — DUE IN NEXT 3 DAYS (${billing3day.length})`);
@@ -584,6 +799,7 @@ function detectIntent(text) {
   if (t.match(/servic|drop.?off|pickup|this week|next \d+ days?|upcoming|getting a container|getting a trailer|being service|initial deliver/)) return 'upcoming';
   if (t.match(/balanc|owed|outstanding|due|unpaid/)) return 'balances';
   if (t.match(/how many|count|total jobs|revenue|stats|scoreboard/)) return 'howmany';
+  if (t.match(/flag|anomal|issue|problem|wrong|stale|leak/)) return 'flags';
   if (t.match(/storag|active|open job|all open/)) return 'active';
   if (t.match(/summar|daily|today/)) return 'summary';
   return 'general';
@@ -600,6 +816,7 @@ function parseQuery(text) {
   else if (/^\/balances\b/.test(t)) command = 'balances';
   else if (/^\/active\b/.test(t)) command = 'active';
   else if (/^\/howmany\b/.test(t)) command = 'howmany';
+  else if (/^\/flags\b/.test(t)) command = 'flags';
   else command = detectIntent(text);
 
   const daysMatch = t.match(/(\d+)\s*days?/) || t.match(/\/(?:billing|upcoming|summary)\s+(\d+)\b/);
@@ -715,6 +932,7 @@ app.post('/webhook', async (req, res) => {
         `/balances        — open customer balances\n` +
         `/active          — all active (billable) jobs\n` +
         `/howmany         — counts, revenue, margin scoreboard\n` +
+        `/flags           — revenue-protection anomalies (cancelled w/ balance, status mismatches, etc.)\n` +
         `/testbrief       — fire the 8AM morning brief now (test)\n` +
         `/debug           — sheet diagnostics\n` +
         `/myid            — your Telegram chat ID\n\n` +
@@ -789,6 +1007,12 @@ app.post('/webhook', async (req, res) => {
       // Scoreboard is purely numeric — bypass Claude, send the raw report.
       const stats = getHowMany(jobs);
       rawAnswer = `=== AVANTI SCOREBOARD${filterTag} ===\n\n` + formatHowMany(stats, jobs);
+      bypassClaude = true;
+
+    } else if (command === 'flags') {
+      // Anomaly detection — purely deterministic, bypass Claude.
+      const flags = getFlags(jobs);
+      rawAnswer = formatFlags(flags);
       bypassClaude = true;
 
     } else if (command === 'summary') {
