@@ -16,7 +16,21 @@ if (!TELEGRAM_TOKEN) {
   process.exit(1);
 }
 if (!ANTHROPIC_KEY) console.warn('WARN: ANTHROPIC_API_KEY not set');
-if (!GOOGLE_KEY) console.warn('WARN: GOOGLE_API_KEY not set');
+if (!GOOGLE_KEY) {
+  console.error('FATAL: GOOGLE_API_KEY env var not set.');
+  process.exit(1);
+}
+
+// Writes go through an Apps Script proxy living inside the sheet.
+// If either env var is missing, the bot runs in read-only mode and refuses write commands.
+const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
+const APPS_SCRIPT_SECRET = process.env.APPS_SCRIPT_SECRET;
+const writesEnabled = !!(APPS_SCRIPT_URL && APPS_SCRIPT_SECRET);
+if (!writesEnabled) {
+  console.warn('APPS_SCRIPT_URL or APPS_SCRIPT_SECRET not set — running in READ-ONLY mode. Write commands will be rejected.');
+} else {
+  console.log(`Writes enabled via Apps Script proxy: ${APPS_SCRIPT_URL}`);
+}
 
 const ALLOWED_CHAT_IDS = (process.env.ALLOWED_CHAT_IDS || '')
   .split(',')
@@ -186,6 +200,11 @@ let jobCache = null;
 let cacheTime = 0;
 const CACHE_TTL = 60000;
 
+function invalidateCache() {
+  jobCache = null;
+  cacheTime = 0;
+}
+
 async function getJobs(forceRefresh = false) {
   if (!forceRefresh && jobCache && (Date.now() - cacheTime) < CACHE_TTL) {
     diag.cacheHits++;
@@ -241,6 +260,7 @@ async function getJobs(forceRefresh = false) {
     const r = rows[i];
     const jobId = get(r, COL.JOB);
     if (!jobId || !jobId.startsWith('A')) continue;
+    r._sheetRow = i + 1; // 1-based row number as it appears in the sheet UI
     jobs.push(r);
     (jobIdRows[jobId] = jobIdRows[jobId] || []).push(i + 1);
   }
@@ -256,6 +276,103 @@ async function getJobs(forceRefresh = false) {
   jobCache = jobs;
   cacheTime = Date.now();
   return jobs;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sheet writes — go through Apps Script proxy living inside the sheet
+// ─────────────────────────────────────────────────────────────────────────────
+
+function colLetter(idx) {
+  return String.fromCharCode(65 + idx);
+}
+
+async function callAppsScript(action, params) {
+  if (!writesEnabled) {
+    throw new Error('Write commands disabled. Set APPS_SCRIPT_URL and APPS_SCRIPT_SECRET on Render.');
+  }
+  const res = await fetch(APPS_SCRIPT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ secret: APPS_SCRIPT_SECRET, action, ...params })
+  });
+  const text = await res.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`Apps Script returned non-JSON (HTTP ${res.status}): ${text.slice(0, 200)}`);
+  }
+  if (!data.ok) throw new Error(`Apps Script error: ${data.error || 'unknown'}`);
+  return data;
+}
+
+async function updateCell(rowNumber, colIndex, value) {
+  await callAppsScript('updateCell', { row: rowNumber, col: colIndex, value });
+  invalidateCache();
+}
+
+async function updateCells(rowNumber, updates /* { colIndex: value, ... } */) {
+  const updateList = Object.entries(updates).map(([col, value]) => ({ col: parseInt(col), value }));
+  await callAppsScript('updateCells', { row: rowNumber, updates: updateList });
+  invalidateCache();
+}
+
+// Locate a single row in the loaded jobs by Job #, optionally disambiguated by Vendor Order #.
+function findJobRow(jobs, jobId, vendorOrder) {
+  const upperJob = jobId.toUpperCase();
+  const matches = jobs.filter(r => get(r, COL.JOB).toUpperCase() === upperJob);
+  if (matches.length === 0) {
+    return { error: `Job ${jobId} not found.` };
+  }
+  if (matches.length === 1) {
+    return { row: matches[0] };
+  }
+  if (!vendorOrder) {
+    const list = matches.map(r => `vo:${get(r, COL.VENDOR_ORDER) || '(blank)'} (sheet row ${r._sheetRow}, status ${get(r, COL.STATUS)})`).join('\n  ');
+    return { error: `Job ${jobId} has ${matches.length} containers. Disambiguate with vo:VENDOR_ORDER#:\n  ${list}` };
+  }
+  const matched = matches.find(r => get(r, COL.VENDOR_ORDER) === vendorOrder);
+  if (!matched) return { error: `No container with vo:${vendorOrder} for job ${jobId}.` };
+  return { row: matched };
+}
+
+// Parse a write command's args into { jobId, vendorOrder, rest }.
+// Format: <JOB#> [vo:VENDOR_ORDER#] <rest of args>
+function parseWriteArgs(argString) {
+  const tokens = argString.trim().split(/\s+/);
+  if (tokens.length === 0 || !tokens[0]) return { error: 'Missing job number.' };
+  const jobId = tokens[0];
+  let vendorOrder = null;
+  let restStart = 1;
+  if (tokens[1] && tokens[1].toLowerCase().startsWith('vo:')) {
+    vendorOrder = tokens[1].slice(3);
+    restStart = 2;
+  }
+  const rest = tokens.slice(restStart).join(' ').trim();
+  return { jobId, vendorOrder, rest };
+}
+
+function formatRowFull(r) {
+  return [
+    `Job #:               ${get(r, COL.JOB)}`,
+    `Vendor Order #:      ${get(r, COL.VENDOR_ORDER)}`,
+    `Sheet row:           ${r._sheetRow}`,
+    `Phone:               ${get(r, COL.PHONE)}`,
+    `Email:               ${get(r, COL.EMAIL)}`,
+    `Booked Date:         ${get(r, COL.BOOKED_DATE)}`,
+    `Initial Service:     ${get(r, COL.INITIAL_SERVICE)}`,
+    `Status:              ${get(r, COL.STATUS)}`,
+    `From → To:           ${get(r, COL.FROM_STATE)} → ${get(r, COL.TO_STATE)}`,
+    `Service Provider:    ${get(r, COL.PROVIDER)}`,
+    `Vendor Cost:         ${fmtMoney(stripDollar(get(r, COL.VENDOR_COST)))}`,
+    `Vendor Storage:      ${fmtMoney(stripDollar(get(r, COL.VENDOR_STORAGE)))}`,
+    `Avanti Storage:      ${fmtMoney(stripDollar(get(r, COL.AVANTI_STORAGE)))}`,
+    `Sold Price (Avanti): ${fmtMoney(stripDollar(get(r, COL.SELL_PRICE)))}`,
+    `Margin:              ${fmtMoney(stripDollar(get(r, COL.MARGIN)))} (${get(r, COL.MARGIN_PCT)})`,
+    `Deposit:             ${fmtMoney(stripDollar(get(r, COL.DEPOSIT_AMT)))} on ${get(r, COL.DEPOSIT_DATE)} (${get(r, COL.PAYMENT_METHOD)})`,
+    `Remaining Balance:   ${fmtMoney(stripDollar(get(r, COL.BALANCE)))} due ${get(r, COL.BALANCE_DATE)} (${get(r, COL.BALANCE_PAYMENT)})`,
+    `Notes:               ${get(r, COL.NOTES) || '(none)'}`
+  ].join('\n');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -861,6 +978,9 @@ async function buildDebugReport() {
   lines.push(`TELEGRAM_TOKEN:   ${TELEGRAM_TOKEN ? 'set (env)' : 'MISSING'}`);
   lines.push(`ANTHROPIC_API_KEY:${ANTHROPIC_KEY ? ' set' : ' MISSING'}`);
   lines.push(`GOOGLE_API_KEY:   ${GOOGLE_KEY ? 'set' : 'MISSING'}`);
+  lines.push(`APPS_SCRIPT_URL:  ${APPS_SCRIPT_URL ? 'set' : 'MISSING'}`);
+  lines.push(`APPS_SCRIPT_SECRET:${APPS_SCRIPT_SECRET ? ' set' : ' MISSING'}`);
+  lines.push(`Writes enabled:   ${writesEnabled ? 'YES' : 'no (read-only)'}`);
   lines.push(`Allowed chat IDs: ${ALLOWED_CHAT_IDS.length} (${ALLOWED_CHAT_IDS.join(', ')})`);
   lines.push('');
   lines.push('--- SHEET ---');
@@ -933,9 +1053,14 @@ app.post('/webhook', async (req, res) => {
         `/active          — all active (billable) jobs\n` +
         `/howmany         — counts, revenue, margin scoreboard\n` +
         `/flags           — revenue-protection anomalies (cancelled w/ balance, status mismatches, etc.)\n` +
+        `/lookup <JOB#>   — full detail on one job\n` +
+        `/setstatus <JOB#> [vo:VO#] <status>  — change column G\n` +
+        `/addnote <JOB#> [vo:VO#] <text>      — append timestamped note to column W\n` +
+        `/zerobalance <JOB#> [vo:VO#]         — clear balance + bill date\n` +
         `/testbrief       — fire the 8AM morning brief now (test)\n` +
         `/debug           — sheet diagnostics\n` +
         `/myid            — your Telegram chat ID\n\n` +
+        `Multi-container jobs: add vo:VENDOR_ORDER# to disambiguate.\n\n` +
         `AUTO BRIEF\n` +
         `Daily ${BRIEF_CRON} (${BRIEF_TIMEZONE}) → ${BRIEF_CHAT_IDS.length} chat(s)\n\n` +
         `FILTERS — add a vendor or state to any query\n` +
@@ -958,6 +1083,93 @@ app.post('/webhook', async (req, res) => {
     if (text === '/testbrief') {
       await sendTelegram(chatId, 'Building morning brief...');
       await fireMorningBrief('manual /testbrief');
+      return;
+    }
+
+    // ───── Read & write commands targeting a specific job ─────
+    const lookupMatch = text.match(/^\/lookup\s+(.+)$/i);
+    if (lookupMatch) {
+      await sendTelegram(chatId, 'Looking up...');
+      const jobs = await getJobs(true);
+      const upper = lookupMatch[1].trim().toUpperCase();
+      const matches = jobs.filter(r => get(r, COL.JOB).toUpperCase() === upper);
+      if (matches.length === 0) {
+        await sendTelegram(chatId, `Job ${lookupMatch[1].trim()} not found.`);
+      } else {
+        const blocks = matches.map((r, i) =>
+          `=== Container ${i + 1} of ${matches.length} ===\n` + formatRowFull(r)
+        );
+        await sendTelegram(chatId, blocks.join('\n\n'));
+      }
+      return;
+    }
+
+    const setStatusMatch = text.match(/^\/setstatus\s+(.+)$/i);
+    if (setStatusMatch) {
+      const { jobId, vendorOrder, rest, error: parseErr } = parseWriteArgs(setStatusMatch[1]);
+      if (parseErr) { await sendTelegram(chatId, parseErr); return; }
+      if (!rest) { await sendTelegram(chatId, `Usage: /setstatus <JOB#> [vo:VENDOR_ORDER#] <new status>`); return; }
+      const jobs = await getJobs(true);
+      const lookup = findJobRow(jobs, jobId, vendorOrder);
+      if (lookup.error) { await sendTelegram(chatId, lookup.error); return; }
+      const before = get(lookup.row, COL.STATUS);
+      try {
+        await updateCell(lookup.row._sheetRow, COL.STATUS, rest);
+        await sendTelegram(chatId,
+          `Updated ${jobId} (sheet row ${lookup.row._sheetRow})\n` +
+          `Status: "${before}" → "${rest}"`
+        );
+      } catch (e) {
+        await sendTelegram(chatId, `Update failed: ${e.message}`);
+      }
+      return;
+    }
+
+    const addNoteMatch = text.match(/^\/addnote\s+(.+)$/i);
+    if (addNoteMatch) {
+      const { jobId, vendorOrder, rest, error: parseErr } = parseWriteArgs(addNoteMatch[1]);
+      if (parseErr) { await sendTelegram(chatId, parseErr); return; }
+      if (!rest) { await sendTelegram(chatId, `Usage: /addnote <JOB#> [vo:VENDOR_ORDER#] <note text>`); return; }
+      const jobs = await getJobs(true);
+      const lookup = findJobRow(jobs, jobId, vendorOrder);
+      if (lookup.error) { await sendTelegram(chatId, lookup.error); return; }
+      const stamp = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: '2-digit', timeZone: BRIEF_TIMEZONE });
+      const existing = get(lookup.row, COL.NOTES);
+      const newNote = existing
+        ? `${existing} | [${stamp}] ${rest}`
+        : `[${stamp}] ${rest}`;
+      try {
+        await updateCell(lookup.row._sheetRow, COL.NOTES, newNote);
+        await sendTelegram(chatId,
+          `Note added to ${jobId} (sheet row ${lookup.row._sheetRow})\n\n` +
+          `BEFORE: ${existing || '(empty)'}\n\n` +
+          `AFTER:  ${newNote}`
+        );
+      } catch (e) {
+        await sendTelegram(chatId, `Update failed: ${e.message}`);
+      }
+      return;
+    }
+
+    const zeroBalanceMatch = text.match(/^\/zerobalance\s+(.+)$/i);
+    if (zeroBalanceMatch) {
+      const { jobId, vendorOrder, error: parseErr } = parseWriteArgs(zeroBalanceMatch[1]);
+      if (parseErr) { await sendTelegram(chatId, parseErr); return; }
+      const jobs = await getJobs(true);
+      const lookup = findJobRow(jobs, jobId, vendorOrder);
+      if (lookup.error) { await sendTelegram(chatId, lookup.error); return; }
+      const beforeBal = get(lookup.row, COL.BALANCE);
+      const beforeDate = get(lookup.row, COL.BALANCE_DATE);
+      try {
+        await updateCells(lookup.row._sheetRow, { [COL.BALANCE]: '', [COL.BALANCE_DATE]: '' });
+        await sendTelegram(chatId,
+          `Cleared balance on ${jobId} (sheet row ${lookup.row._sheetRow})\n` +
+          `Balance:  "${beforeBal}" → ""\n` +
+          `Bill date: "${beforeDate}" → ""`
+        );
+      } catch (e) {
+        await sendTelegram(chatId, `Update failed: ${e.message}`);
+      }
       return;
     }
 
@@ -1050,8 +1262,14 @@ app.listen(PORT, () => {
   // Schedule the morning brief. Validate the cron pattern up front so a typo fails loud.
   if (!cron.validate(BRIEF_CRON)) {
     console.error(`FATAL: BRIEF_CRON "${BRIEF_CRON}" is not a valid cron expression. Bot is up but morning brief is disabled.`);
-    return;
+  } else {
+    cron.schedule(BRIEF_CRON, () => fireMorningBrief(`scheduled cron ${BRIEF_CRON} ${BRIEF_TIMEZONE}`), { timezone: BRIEF_TIMEZONE });
+    console.log(`Morning brief scheduled: cron="${BRIEF_CRON}" tz="${BRIEF_TIMEZONE}" → chats=[${BRIEF_CHAT_IDS.join(', ')}]`);
   }
-  cron.schedule(BRIEF_CRON, () => fireMorningBrief(`scheduled cron ${BRIEF_CRON} ${BRIEF_TIMEZONE}`), { timezone: BRIEF_TIMEZONE });
-  console.log(`Morning brief scheduled: cron="${BRIEF_CRON}" tz="${BRIEF_TIMEZONE}" → chats=[${BRIEF_CHAT_IDS.join(', ')}]`);
+  // Verify Apps Script proxy is reachable so any auth/URL issues fail loud at boot, not on first write.
+  if (writesEnabled) {
+    callAppsScript('ping', {})
+      .then(d => console.log(`Apps Script ping OK: sheet=${d.sheet} time=${d.time}`))
+      .catch(e => console.error(`Apps Script ping FAILED: ${e.message}`));
+  }
 });
