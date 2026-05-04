@@ -17,6 +17,15 @@ if (!TELEGRAM_TOKEN) {
 if (!ANTHROPIC_KEY) console.warn('WARN: ANTHROPIC_API_KEY not set');
 if (!GOOGLE_KEY) console.warn('WARN: GOOGLE_API_KEY not set');
 
+const ALLOWED_CHAT_IDS = (process.env.ALLOWED_CHAT_IDS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+if (ALLOWED_CHAT_IDS.length === 0) {
+  console.error('FATAL: ALLOWED_CHAT_IDS env var not set. Add a comma-separated list of authorized Telegram chat IDs.');
+  process.exit(1);
+}
+
 // Column indices (0-based) — matches sheet exactly
 const COL = {
   JOB: 0, VENDOR_ORDER: 1, PHONE: 2, EMAIL: 3, BOOKED_DATE: 4,
@@ -25,6 +34,9 @@ const COL = {
   MARGIN: 14, MARGIN_PCT: 15, DEPOSIT_AMT: 16, DEPOSIT_DATE: 17,
   PAYMENT_METHOD: 18, BALANCE: 19, BALANCE_DATE: 20, BALANCE_PAYMENT: 21, NOTES: 22
 };
+
+// Statuses that exclude a job from active/billable consideration
+const NON_ACTIVE_STATUSES = ['completed', 'cancelled', 'future order'];
 
 // Diagnostic state — populated on every getJobs() call, surfaced by /debug
 const diag = {
@@ -37,6 +49,7 @@ const diag = {
   firstColAValues: [],
   rawHeaders: [],
   jobsLoaded: null,
+  duplicates: [],
   cacheHits: 0,
   cacheMisses: 0,
   bootedAt: new Date()
@@ -45,9 +58,29 @@ const diag = {
 function parseDate(str) {
   if (!str || str.trim() === '') return null;
   str = str.trim();
-  const year = new Date().getFullYear();
-  const md = str.match(/^(\d{1,2})\/(\d{1,2})(?:\/\d{2,4})?$/);
-  if (md) return new Date(year, parseInt(md[1]) - 1, parseInt(md[2]));
+  const md = str.match(/^(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?$/);
+  if (md) {
+    const month = parseInt(md[1]);
+    const day = parseInt(md[2]);
+    if (md[3]) {
+      // Year was explicitly given (handle 2- and 4-digit forms)
+      let year = parseInt(md[3]);
+      if (year < 100) year += 2000;
+      return new Date(year, month - 1, day);
+    }
+    // No year — pick the year that puts this date closest to today.
+    // If the current-year candidate is more than 6 months in the future, the date
+    // is almost certainly from last year (sheet entries don't get pre-filled a year out).
+    const today = new Date();
+    const thisYear = today.getFullYear();
+    const candidate = new Date(thisYear, month - 1, day);
+    const sixMonthsAhead = new Date(today);
+    sixMonthsAhead.setMonth(sixMonthsAhead.getMonth() + 6);
+    if (candidate > sixMonthsAhead) {
+      return new Date(thisYear - 1, month - 1, day);
+    }
+    return candidate;
+  }
   const full = new Date(str);
   if (!isNaN(full)) return full;
   return null;
@@ -69,6 +102,12 @@ function stripDollar(str) {
 
 function get(row, col) {
   return (row[col] || '').toString().trim();
+}
+
+function isActive(row) {
+  const status = get(row, COL.STATUS).toLowerCase();
+  if (!status) return false;
+  return !NON_ACTIVE_STATUSES.some(s => status.includes(s));
 }
 
 // 60-second cache
@@ -124,19 +163,25 @@ async function getJobs(forceRefresh = false) {
     `${String.fromCharCode(65 + i)}: "${(h || '').toString().replace(/\n/g, '\\n').trim()}"`
   );
   console.log('Header row index:', headerIdx);
-  rawHeaders.forEach((h, i) => {
-    console.log(`  Col ${i} (${String.fromCharCode(65 + i)}): "${(h || '').toString().replace(/\n/g, '\\n').trim()}"`);
-  });
 
+  const seen = new Set();
+  const duplicates = [];
   const jobs = [];
   for (let i = headerIdx + 1; i < rows.length; i++) {
     const r = rows[i];
     const jobId = get(r, COL.JOB);
     if (!jobId || !jobId.startsWith('A')) continue;
+    if (seen.has(jobId)) {
+      duplicates.push(`${jobId} (sheet row ${i + 1})`);
+      console.warn(`Duplicate job ID ${jobId} at sheet row ${i + 1} — skipping`);
+      continue;
+    }
+    seen.add(jobId);
     jobs.push(r);
   }
-  console.log(`Loaded ${jobs.length} jobs`);
+  console.log(`Loaded ${jobs.length} jobs (skipped ${duplicates.length} duplicate(s))`);
   diag.jobsLoaded = jobs.length;
+  diag.duplicates = duplicates;
   diag.lastSheetStatus = 'OK';
   diag.lastSheetError = null;
   diag.lastSheetPull = new Date();
@@ -150,9 +195,10 @@ function nextBillingDate(svcDateStr) {
   if (!svcDate) return null;
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  // Original invoice covers the first 30 days. First billing cycle ends svcDate + 30.
   let billing = new Date(svcDate);
+  billing.setDate(billing.getDate() + 30);
   while (billing < today) {
-    billing = new Date(billing);
     billing.setDate(billing.getDate() + 30);
   }
   return billing;
@@ -176,7 +222,14 @@ function getBalances(jobs) {
   return jobs.filter(r => stripDollar(get(r, COL.BALANCE)) > 0);
 }
 
-function getStorageJobs(jobs) {
+// All jobs we currently have responsibility for (anything not Completed/Cancelled/Future Order).
+// Replaces the old narrow getStorageJobs that only matched literal "storage" in the status string.
+function getActiveJobs(jobs) {
+  return jobs.filter(isActive);
+}
+
+// Narrow query: jobs literally sitting in storage right now (status contains "storage").
+function getLiteralStorageJobs(jobs) {
   return jobs.filter(r => get(r, COL.STATUS).toLowerCase().includes('storage'));
 }
 
@@ -185,11 +238,7 @@ function getStorageBillingDue(jobs, days) {
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const end = new Date(today);
   end.setDate(end.getDate() + days);
-  const excludedStatuses = ['completed', 'cancelled', 'future order'];
-  const activeJobs = jobs.filter(r => {
-    const status = get(r, COL.STATUS).toLowerCase();
-    return !excludedStatuses.some(s => status.includes(s));
-  });
+  const activeJobs = jobs.filter(isActive);
   const results = [];
   for (const r of activeJobs) {
     const svcDateStr = get(r, COL.INITIAL_SERVICE);
@@ -266,7 +315,7 @@ function detectIntent(text) {
   if (t.match(/storage.*(bill|due|charge|payment|billing)|bill.*storage|who.*storage.*bill|storage.*this week|monthly rental/)) return 'storage_billing';
   if (t.match(/servic|drop.?off|pickup|this week|next \d+ days?|upcoming|getting a container|getting a trailer|being service|initial deliver/)) return 'upcoming';
   if (t.match(/balanc|owed|outstanding|due|unpaid/)) return 'balances';
-  if (t.match(/storag/)) return 'storage';
+  if (t.match(/storag|active|open job|all open/)) return 'active';
   if (t.match(/summar|daily|today/)) return 'summary';
   return 'general';
 }
@@ -284,7 +333,6 @@ async function sendTelegram(chatId, text) {
 }
 
 async function buildDebugReport() {
-  // Force a fresh pull so the report reflects the live sheet, not cached state
   let pullError = null;
   try {
     await getJobs(true);
@@ -301,6 +349,7 @@ async function buildDebugReport() {
   lines.push(`TELEGRAM_TOKEN:   ${TELEGRAM_TOKEN ? 'set (env)' : 'MISSING'}`);
   lines.push(`ANTHROPIC_API_KEY:${ANTHROPIC_KEY ? ' set' : ' MISSING'}`);
   lines.push(`GOOGLE_API_KEY:   ${GOOGLE_KEY ? 'set' : 'MISSING'}`);
+  lines.push(`Allowed chat IDs: ${ALLOWED_CHAT_IDS.length} (${ALLOWED_CHAT_IDS.join(', ')})`);
   lines.push('');
   lines.push('--- SHEET ---');
   lines.push(`Sheet ID:         ${SHEET_ID}`);
@@ -315,6 +364,7 @@ async function buildDebugReport() {
   lines.push(`Total rows from Sheets API: ${diag.totalRows ?? 'n/a'}`);
   lines.push(`Header row index detected:  ${diag.headerIdx ?? 'n/a'}  (0-based; sheet row 4 = index 3)`);
   lines.push(`Jobs loaded (col A "A..."): ${diag.jobsLoaded ?? 'n/a'}`);
+  lines.push(`Duplicates skipped:         ${diag.duplicates.length}${diag.duplicates.length ? ' → ' + diag.duplicates.join(', ') : ''}`);
   lines.push(`Cache hits / misses:        ${diag.cacheHits} / ${diag.cacheMisses}`);
   lines.push('');
   lines.push('--- FIRST 12 ROWS, COLUMN A ---');
@@ -325,6 +375,10 @@ async function buildDebugReport() {
   return lines.join('\n');
 }
 
+function isAuthorized(chatId) {
+  return ALLOWED_CHAT_IDS.includes(String(chatId));
+}
+
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
   try {
@@ -333,22 +387,7 @@ app.post('/webhook', async (req, res) => {
     const chatId = msg.chat.id;
     const text = msg.text.trim();
 
-    if (text === '/start') {
-      await sendTelegram(chatId,
-        `Avanti Ops is online.\n\n` +
-        `Try:\n` +
-        `- Who is getting serviced this week?\n` +
-        `- Who has outstanding balances?\n` +
-        `- Who needs storage billing this week?\n` +
-        `- Who is in storage?\n` +
-        `- Daily summary\n\n` +
-        `Diagnostics:\n` +
-        `- /debug — sheet pull diagnostics\n` +
-        `- /myid  — show your Telegram chat ID`
-      );
-      return;
-    }
-
+    // /myid is always available so future authorized users can self-identify.
     if (text === '/myid') {
       const username = msg.from?.username ? '@' + msg.from.username : 'n/a';
       const name = `${msg.from?.first_name || ''} ${msg.from?.last_name || ''}`.trim() || 'n/a';
@@ -356,7 +395,29 @@ app.post('/webhook', async (req, res) => {
         `Telegram chat ID: ${chatId}\n` +
         `Username:         ${username}\n` +
         `Name:             ${name}\n\n` +
-        `Send the chat ID above to wire up morning auto-summary.`
+        `Forward this chat ID to the bot administrator to request access.`
+      );
+      return;
+    }
+
+    if (!isAuthorized(chatId)) {
+      console.warn(`Unauthorized access attempt from chat ${chatId} (${msg.from?.username || 'no username'})`);
+      await sendTelegram(chatId, 'Not authorized. Send /myid and forward the result to the administrator.');
+      return;
+    }
+
+    if (text === '/start') {
+      await sendTelegram(chatId,
+        `Avanti Ops is online.\n\n` +
+        `Try:\n` +
+        `- Who is getting serviced this week?\n` +
+        `- Who has outstanding balances?\n` +
+        `- Who needs storage billing this week?\n` +
+        `- Who is in storage? (all active jobs)\n` +
+        `- Daily summary\n\n` +
+        `Diagnostics:\n` +
+        `- /debug — sheet pull diagnostics\n` +
+        `- /myid  — show your Telegram chat ID`
       );
       return;
     }
@@ -401,18 +462,18 @@ app.post('/webhook', async (req, res) => {
         ? `${bal.length} jobs with outstanding balances:\n\n${bal.map(formatJob).join('\n')}`
         : 'No outstanding balances.';
 
-    } else if (intent === 'storage') {
-      const storage = getStorageJobs(jobs);
-      context = storage.length > 0
-        ? `${storage.length} storage jobs:\n\n${storage.map(formatJob).join('\n')}`
-        : 'No storage jobs found.';
+    } else if (intent === 'active') {
+      const active = getActiveJobs(jobs);
+      context = active.length > 0
+        ? `${active.length} active jobs (excludes Completed, Cancelled, Future Order):\n\n${active.map(formatJob).join('\n')}`
+        : 'No active jobs found.';
 
     } else if (intent === 'summary') {
       const upcoming = getUpcomingJobs(jobs, 7);
       const balances = getBalances(jobs);
       const storageBilling = getStorageBillingDue(jobs, 7);
-      const storage = getStorageJobs(jobs);
-      context = `DAILY SUMMARY\n\nUpcoming service (7 days): ${upcoming.length}\n${upcoming.map(formatJob).join('\n')}\n\nStorage billing due (7 days): ${storageBilling.length}\n${storageBilling.map(formatStorageBilling).join('\n')}\n\nOutstanding balances: ${balances.length}\n${balances.map(formatJob).join('\n')}\n\nAll storage jobs: ${storage.length}\n${storage.map(formatJob).join('\n')}`;
+      const active = getActiveJobs(jobs);
+      context = `DAILY SUMMARY\n\nUpcoming service (next 7 days): ${upcoming.length}\n${upcoming.map(formatJob).join('\n')}\n\nStorage billing due (next 7 days): ${storageBilling.length}\n${storageBilling.map(formatStorageBilling).join('\n')}\n\nOutstanding balances: ${balances.length}\n${balances.map(formatJob).join('\n')}\n\nAll active jobs (excludes Completed/Cancelled/Future Order): ${active.length}\n${active.map(formatJob).join('\n')}`;
 
     } else {
       context = `All ${jobs.length} jobs:\n\n${jobs.map(formatJob).join('\n')}`;
@@ -425,7 +486,7 @@ app.post('/webhook', async (req, res) => {
     console.error('Webhook error:', e.message);
     try {
       const chatId = req.body?.message?.chat?.id;
-      if (chatId) await sendTelegram(chatId, `Error: ${e.message}`);
+      if (chatId && isAuthorized(chatId)) await sendTelegram(chatId, `Error: ${e.message}`);
     } catch {}
   }
 });
