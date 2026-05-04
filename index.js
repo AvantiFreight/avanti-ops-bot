@@ -49,11 +49,69 @@ const diag = {
   firstColAValues: [],
   rawHeaders: [],
   jobsLoaded: null,
-  duplicates: [],
+  multiContainerGroups: [],
   cacheHits: 0,
   cacheMisses: 0,
   bootedAt: new Date()
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Vendor + state lookup tables
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Each entry: { match: substring or regex (lowercased), label: canonical filter token }
+// Filter checks if the row's PROVIDER (lowercased) includes the label.
+const VENDOR_PATTERNS = [
+  { match: 'pods', label: 'pods' },
+  { match: '1800packrat', label: 'packrat' },
+  { match: '1-800-packrat', label: 'packrat' },
+  { match: '1-800-pack-rat', label: 'packrat' },
+  { match: 'packrat', label: 'packrat' },
+  { match: 'pack rat', label: 'packrat' },
+  { match: 'zippy', label: 'zippy' },
+  { match: 'units', label: 'units' },
+  { match: 'estes', label: 'estes' },
+  { match: 'suremove', label: 'estes' },
+  { match: 'old dominion', label: 'old dominion' },
+  { match: 'odhh', label: 'old dominion' }
+];
+
+// US state lookup. Keys are lowercased name + 2-letter code; value is the canonical 2-letter code.
+const STATES = {
+  'al': 'AL', 'alabama': 'AL', 'ak': 'AK', 'alaska': 'AK',
+  'az': 'AZ', 'arizona': 'AZ', 'ar': 'AR', 'arkansas': 'AR',
+  'ca': 'CA', 'california': 'CA', 'co': 'CO', 'colorado': 'CO',
+  'ct': 'CT', 'connecticut': 'CT', 'de': 'DE', 'delaware': 'DE',
+  'fl': 'FL', 'florida': 'FL', 'ga': 'GA', 'georgia': 'GA',
+  'hi': 'HI', 'hawaii': 'HI', 'id': 'ID', 'idaho': 'ID',
+  'il': 'IL', 'illinois': 'IL', 'in': 'IN', 'indiana': 'IN',
+  'ia': 'IA', 'iowa': 'IA', 'ks': 'KS', 'kansas': 'KS',
+  'ky': 'KY', 'kentucky': 'KY', 'la': 'LA', 'louisiana': 'LA',
+  'me': 'ME', 'maine': 'ME', 'md': 'MD', 'maryland': 'MD',
+  'ma': 'MA', 'massachusetts': 'MA', 'mi': 'MI', 'michigan': 'MI',
+  'mn': 'MN', 'minnesota': 'MN', 'ms': 'MS', 'mississippi': 'MS',
+  'mo': 'MO', 'missouri': 'MO', 'mt': 'MT', 'montana': 'MT',
+  'ne': 'NE', 'nebraska': 'NE', 'nv': 'NV', 'nevada': 'NV',
+  'nh': 'NH', 'new hampshire': 'NH', 'nj': 'NJ', 'new jersey': 'NJ',
+  'nm': 'NM', 'new mexico': 'NM', 'ny': 'NY', 'new york': 'NY',
+  'nc': 'NC', 'north carolina': 'NC', 'nd': 'ND', 'north dakota': 'ND',
+  'oh': 'OH', 'ohio': 'OH', 'ok': 'OK', 'oklahoma': 'OK',
+  'or': 'OR', 'oregon': 'OR', 'pa': 'PA', 'pennsylvania': 'PA',
+  'ri': 'RI', 'rhode island': 'RI', 'sc': 'SC', 'south carolina': 'SC',
+  'sd': 'SD', 'south dakota': 'SD', 'tn': 'TN', 'tennessee': 'TN',
+  'tx': 'TX', 'texas': 'TX', 'ut': 'UT', 'utah': 'UT',
+  'vt': 'VT', 'vermont': 'VT', 'va': 'VA', 'virginia': 'VA',
+  'wa': 'WA', 'washington': 'WA', 'wv': 'WV', 'west virginia': 'WV',
+  'wi': 'WI', 'wisconsin': 'WI', 'wy': 'WY', 'wyoming': 'WY',
+  'dc': 'DC', 'district of columbia': 'DC'
+};
+
+// 2-letter codes that collide with common English words — require uppercase context to match
+const AMBIGUOUS_STATE_CODES = new Set(['or', 'in', 'me', 'hi', 'al', 'la', 'ok', 'pa', 'co', 'de']);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 function parseDate(str) {
   if (!str || str.trim() === '') return null;
@@ -63,14 +121,10 @@ function parseDate(str) {
     const month = parseInt(md[1]);
     const day = parseInt(md[2]);
     if (md[3]) {
-      // Year was explicitly given (handle 2- and 4-digit forms)
       let year = parseInt(md[3]);
       if (year < 100) year += 2000;
       return new Date(year, month - 1, day);
     }
-    // No year — pick the year that puts this date closest to today.
-    // If the current-year candidate is more than 6 months in the future, the date
-    // is almost certainly from last year (sheet entries don't get pre-filled a year out).
     const today = new Date();
     const thisYear = today.getFullYear();
     const candidate = new Date(thisYear, month - 1, day);
@@ -95,6 +149,10 @@ function fmtTimestamp(d) {
   return d.toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
 }
 
+function fmtMoney(n) {
+  return '$' + (n || 0).toLocaleString(undefined, { maximumFractionDigits: 0 });
+}
+
 function stripDollar(str) {
   if (!str) return 0;
   return parseFloat(str.toString().replace(/[$,\s]/g, '')) || 0;
@@ -110,7 +168,10 @@ function isActive(row) {
   return !NON_ACTIVE_STATUSES.some(s => status.includes(s));
 }
 
-// 60-second cache
+// ─────────────────────────────────────────────────────────────────────────────
+// Sheet loading
+// ─────────────────────────────────────────────────────────────────────────────
+
 let jobCache = null;
 let cacheTime = 0;
 const CACHE_TTL = 60000;
@@ -162,26 +223,23 @@ async function getJobs(forceRefresh = false) {
   diag.rawHeaders = rawHeaders.map((h, i) =>
     `${String.fromCharCode(65 + i)}: "${(h || '').toString().replace(/\n/g, '\\n').trim()}"`
   );
-  console.log('Header row index:', headerIdx);
 
-  const seen = new Set();
-  const duplicates = [];
+  // Each row = one container. Same Job # can appear on multiple rows (multi-container customers).
   const jobs = [];
+  const jobIdRows = {};
   for (let i = headerIdx + 1; i < rows.length; i++) {
     const r = rows[i];
     const jobId = get(r, COL.JOB);
     if (!jobId || !jobId.startsWith('A')) continue;
-    if (seen.has(jobId)) {
-      duplicates.push(`${jobId} (sheet row ${i + 1})`);
-      console.warn(`Duplicate job ID ${jobId} at sheet row ${i + 1} — skipping`);
-      continue;
-    }
-    seen.add(jobId);
     jobs.push(r);
+    (jobIdRows[jobId] = jobIdRows[jobId] || []).push(i + 1);
   }
-  console.log(`Loaded ${jobs.length} jobs (skipped ${duplicates.length} duplicate(s))`);
+  const multiContainerGroups = Object.entries(jobIdRows)
+    .filter(([, sheetRows]) => sheetRows.length > 1)
+    .map(([jobId, sheetRows]) => `${jobId} × ${sheetRows.length} containers (sheet rows ${sheetRows.join(', ')})`);
+  console.log(`Loaded ${jobs.length} container rows (${multiContainerGroups.length} multi-container job(s))`);
   diag.jobsLoaded = jobs.length;
-  diag.duplicates = duplicates;
+  diag.multiContainerGroups = multiContainerGroups;
   diag.lastSheetStatus = 'OK';
   diag.lastSheetError = null;
   diag.lastSheetPull = new Date();
@@ -190,12 +248,15 @@ async function getJobs(forceRefresh = false) {
   return jobs;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Query functions
+// ─────────────────────────────────────────────────────────────────────────────
+
 function nextBillingDate(svcDateStr) {
   const svcDate = parseDate(svcDateStr);
   if (!svcDate) return null;
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  // Original invoice covers the first 30 days. First billing cycle ends svcDate + 30.
   let billing = new Date(svcDate);
   billing.setDate(billing.getDate() + 30);
   while (billing < today) {
@@ -222,15 +283,8 @@ function getBalances(jobs) {
   return jobs.filter(r => stripDollar(get(r, COL.BALANCE)) > 0);
 }
 
-// All jobs we currently have responsibility for (anything not Completed/Cancelled/Future Order).
-// Replaces the old narrow getStorageJobs that only matched literal "storage" in the status string.
 function getActiveJobs(jobs) {
   return jobs.filter(isActive);
-}
-
-// Narrow query: jobs literally sitting in storage right now (status contains "storage").
-function getLiteralStorageJobs(jobs) {
-  return jobs.filter(r => get(r, COL.STATUS).toLowerCase().includes('storage'));
 }
 
 function getStorageBillingDue(jobs, days) {
@@ -251,6 +305,84 @@ function getStorageBillingDue(jobs, days) {
   results.sort((a, b) => a.nextBilling - b.nextBilling);
   return results;
 }
+
+function getHowMany(jobs) {
+  const total = jobs.length;
+  const active = jobs.filter(isActive);
+  const completed = jobs.filter(r => get(r, COL.STATUS).toLowerCase().includes('completed'));
+  const cancelled = jobs.filter(r => get(r, COL.STATUS).toLowerCase().includes('cancelled'));
+  const future = jobs.filter(r => get(r, COL.STATUS).toLowerCase().includes('future'));
+  const byStatus = {};
+  jobs.forEach(r => {
+    const s = get(r, COL.STATUS) || '(blank)';
+    byStatus[s] = (byStatus[s] || 0) + 1;
+  });
+  const sum = (rows, col) => rows.reduce((s, r) => s + stripDollar(get(r, col)), 0);
+  return {
+    total,
+    activeCount: active.length,
+    completedCount: completed.length,
+    cancelledCount: cancelled.length,
+    futureCount: future.length,
+    byStatus,
+    soldAll: sum(jobs, COL.SELL_PRICE),
+    marginAll: sum(jobs, COL.MARGIN),
+    soldActive: sum(active, COL.SELL_PRICE),
+    marginActive: sum(active, COL.MARGIN),
+    soldCompleted: sum(completed, COL.SELL_PRICE),
+    marginCompleted: sum(completed, COL.MARGIN),
+    outstandingBalance: sum(jobs, COL.BALANCE)
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Filters (vendor, state) — composable on top of any base query
+// ─────────────────────────────────────────────────────────────────────────────
+
+function extractVendor(text) {
+  const t = text.toLowerCase();
+  for (const v of VENDOR_PATTERNS) {
+    if (t.includes(v.match)) return v.label;
+  }
+  return null;
+}
+
+function extractState(text) {
+  // Try multi-word state names first (e.g., "new york")
+  const lower = text.toLowerCase();
+  for (const [name, code] of Object.entries(STATES)) {
+    if (name.includes(' ') && lower.includes(name)) return code;
+  }
+  // Then single-word names and unambiguous 2-letter codes
+  const tokens = text.split(/[^A-Za-z]+/).filter(Boolean);
+  for (const tok of tokens) {
+    const lc = tok.toLowerCase();
+    if (!STATES[lc]) continue;
+    // Ambiguous 2-letter codes (in/or/me/hi/al/la/ok/pa/co/de) only count if the user wrote them in uppercase
+    if (lc.length === 2 && AMBIGUOUS_STATE_CODES.has(lc) && tok !== tok.toUpperCase()) continue;
+    return STATES[lc];
+  }
+  return null;
+}
+
+function applyVendorFilter(jobs, vendor) {
+  if (!vendor) return jobs;
+  return jobs.filter(r => get(r, COL.PROVIDER).toLowerCase().includes(vendor));
+}
+
+function applyStateFilter(jobs, state) {
+  if (!state) return jobs;
+  const upper = state.toUpperCase();
+  return jobs.filter(r => {
+    const from = get(r, COL.FROM_STATE).toUpperCase();
+    const to = get(r, COL.TO_STATE).toUpperCase();
+    return from === upper || to === upper;
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Formatting
+// ─────────────────────────────────────────────────────────────────────────────
 
 function formatJob(r) {
   const bal = stripDollar(get(r, COL.BALANCE));
@@ -282,6 +414,41 @@ function formatStorageBilling(entry) {
   ].filter(Boolean).join(' | ');
 }
 
+function formatHowMany(stats, jobs) {
+  const lines = [];
+  lines.push(`COUNTS`);
+  lines.push(`Total container rows: ${stats.total}`);
+  lines.push(`Active (billable):    ${stats.activeCount}`);
+  lines.push(`Completed:            ${stats.completedCount}`);
+  lines.push(`Cancelled:            ${stats.cancelledCount}`);
+  lines.push(`Future Order:         ${stats.futureCount}`);
+  lines.push('');
+  lines.push(`BY STATUS`);
+  Object.entries(stats.byStatus)
+    .sort((a, b) => b[1] - a[1])
+    .forEach(([s, n]) => lines.push(`  ${s.padEnd(22)} ${n}`));
+  lines.push('');
+  lines.push(`REVENUE (sum of Sold Price column)`);
+  lines.push(`All jobs:       ${fmtMoney(stats.soldAll)}  (margin ${fmtMoney(stats.marginAll)})`);
+  lines.push(`Active jobs:    ${fmtMoney(stats.soldActive)}  (margin ${fmtMoney(stats.marginActive)})`);
+  lines.push(`Completed jobs: ${fmtMoney(stats.soldCompleted)}  (margin ${fmtMoney(stats.marginCompleted)})`);
+  lines.push('');
+  lines.push(`OUTSTANDING`);
+  lines.push(`Total customer balances owed: ${fmtMoney(stats.outstandingBalance)}`);
+  return lines.join('\n');
+}
+
+function describeFilters(vendor, state) {
+  const parts = [];
+  if (vendor) parts.push(`vendor=${vendor}`);
+  if (state) parts.push(`state=${state}`);
+  return parts.length ? ` [filtered: ${parts.join(', ')}]` : '';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Claude
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function askClaude(question, context) {
   const today = new Date().toLocaleDateString('en-US', {
     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
@@ -295,10 +462,16 @@ async function askClaude(question, context) {
     },
     body: JSON.stringify({
       model: 'claude-haiku-4-5-20251001',
-      max_tokens: 800,
-      system: `You are Avanti Ops, internal ops assistant for Avanti Freight Solutions. Today: ${today}. Be concise, direct, no fluff. Format as clean lists. Under 300 words.
+      max_tokens: 4000,
+      system: `You are Avanti Ops, internal ops assistant for Avanti Freight Solutions. Today: ${today}.
 
-CRITICAL STORAGE BILLING RULE: "Paid in full" only covers the initial 30-day rental period and transportation. It does NOT cover subsequent 30-day cycles. Every active job is subject to recurring monthly storage charges regardless of payment status. Always list every flagged job.`,
+The Data block below has been pre-filtered and pre-formatted by code. Your job is to present it back cleanly. RULES:
+- NEVER drop, omit, summarize-away, or "..." any rows. If the Data block lists 22 jobs, your reply lists 22 jobs.
+- Reformat for readability (group by date, vendor, status, etc.) when it helps, but include every row.
+- Be direct. No preamble, no closing summary. The user already knows the question.
+- Use simple plain text — Telegram will render it as-is.
+
+CRITICAL STORAGE BILLING RULE: "Paid in full" only covers the initial 30-day rental period and transportation. It does NOT cover subsequent 30-day cycles. Every active job is subject to recurring monthly storage charges regardless of payment status.`,
       messages: [{ role: 'user', content: `Question: ${question}\n\nData:\n${context}` }]
     })
   });
@@ -310,15 +483,46 @@ CRITICAL STORAGE BILLING RULE: "Paid in full" only covers the initial 30-day ren
   return data.content?.[0]?.text || 'No response from AI.';
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Routing
+// ─────────────────────────────────────────────────────────────────────────────
+
 function detectIntent(text) {
   const t = text.toLowerCase();
   if (t.match(/storage.*(bill|due|charge|payment|billing)|bill.*storage|who.*storage.*bill|storage.*this week|monthly rental/)) return 'storage_billing';
   if (t.match(/servic|drop.?off|pickup|this week|next \d+ days?|upcoming|getting a container|getting a trailer|being service|initial deliver/)) return 'upcoming';
   if (t.match(/balanc|owed|outstanding|due|unpaid/)) return 'balances';
+  if (t.match(/how many|count|total jobs|revenue|stats|scoreboard/)) return 'howmany';
   if (t.match(/storag|active|open job|all open/)) return 'active';
   if (t.match(/summar|daily|today/)) return 'summary';
   return 'general';
 }
+
+function parseQuery(text) {
+  const t = text.toLowerCase().trim();
+  let command = null;
+
+  // Slash commands take priority
+  if (/^\/summary\b/.test(t)) command = 'summary';
+  else if (/^\/billing\b/.test(t)) command = 'storage_billing';
+  else if (/^\/upcoming\b/.test(t)) command = 'upcoming';
+  else if (/^\/balances\b/.test(t)) command = 'balances';
+  else if (/^\/active\b/.test(t)) command = 'active';
+  else if (/^\/howmany\b/.test(t)) command = 'howmany';
+  else command = detectIntent(text);
+
+  const daysMatch = t.match(/(\d+)\s*days?/) || t.match(/\/(?:billing|upcoming|summary)\s+(\d+)\b/);
+  const days = daysMatch ? Math.min(365, parseInt(daysMatch[1])) : 7;
+
+  const vendor = extractVendor(text);
+  const state = extractState(text);
+
+  return { command, days, vendor, state };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Telegram I/O
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function sendTelegram(chatId, text) {
   while (text.length > 0) {
@@ -363,8 +567,8 @@ async function buildDebugReport() {
   lines.push('--- LOAD ---');
   lines.push(`Total rows from Sheets API: ${diag.totalRows ?? 'n/a'}`);
   lines.push(`Header row index detected:  ${diag.headerIdx ?? 'n/a'}  (0-based; sheet row 4 = index 3)`);
-  lines.push(`Jobs loaded (col A "A..."): ${diag.jobsLoaded ?? 'n/a'}`);
-  lines.push(`Duplicates skipped:         ${diag.duplicates.length}${diag.duplicates.length ? ' → ' + diag.duplicates.join(', ') : ''}`);
+  lines.push(`Container rows loaded:      ${diag.jobsLoaded ?? 'n/a'}`);
+  lines.push(`Multi-container jobs:       ${diag.multiContainerGroups.length}${diag.multiContainerGroups.length ? '\n  ' + diag.multiContainerGroups.join('\n  ') : ''}`);
   lines.push(`Cache hits / misses:        ${diag.cacheHits} / ${diag.cacheMisses}`);
   lines.push('');
   lines.push('--- FIRST 12 ROWS, COLUMN A ---');
@@ -378,6 +582,10 @@ async function buildDebugReport() {
 function isAuthorized(chatId) {
   return ALLOWED_CHAT_IDS.includes(String(chatId));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Webhook
+// ─────────────────────────────────────────────────────────────────────────────
 
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
@@ -406,18 +614,24 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    if (text === '/start') {
+    if (text === '/start' || text === '/help') {
       await sendTelegram(chatId,
         `Avanti Ops is online.\n\n` +
-        `Try:\n` +
-        `- Who is getting serviced this week?\n` +
-        `- Who has outstanding balances?\n` +
-        `- Who needs storage billing this week?\n` +
-        `- Who is in storage? (all active jobs)\n` +
-        `- Daily summary\n\n` +
-        `Diagnostics:\n` +
-        `- /debug — sheet pull diagnostics\n` +
-        `- /myid  — show your Telegram chat ID`
+        `SLASH COMMANDS\n` +
+        `/summary         — daily ops brief\n` +
+        `/billing [N]     — storage billing due in next N days (default 7)\n` +
+        `/upcoming [N]    — initial services in next N days (default 7)\n` +
+        `/balances        — open customer balances\n` +
+        `/active          — all active (billable) jobs\n` +
+        `/howmany         — counts, revenue, margin scoreboard\n` +
+        `/debug           — sheet diagnostics\n` +
+        `/myid            — your Telegram chat ID\n\n` +
+        `FILTERS — add a vendor or state to any query\n` +
+        `  /billing PODS        — only PODS billing this week\n` +
+        `  /upcoming Florida    — only FL service drops this week\n` +
+        `  who needs Estes billing in 14 days\n` +
+        `  any active jobs in TX\n\n` +
+        `Or just ask in plain English.`
       );
       return;
     }
@@ -430,57 +644,70 @@ app.post('/webhook', async (req, res) => {
     }
 
     await sendTelegram(chatId, 'Pulling sheet data...');
-    const jobs = await getJobs();
-    const intent = detectIntent(text);
-    let context = '';
+    const allJobs = await getJobs();
+    const { command, days, vendor, state } = parseQuery(text);
 
-    if (intent === 'upcoming') {
-      const daysMatch = text.match(/(\d+)\s*days?/);
-      const days = daysMatch ? parseInt(daysMatch[1]) : 7;
+    // Apply optional vendor + state filters before running the base query
+    const jobs = applyStateFilter(applyVendorFilter(allJobs, vendor), state);
+    const filterTag = describeFilters(vendor, state);
+
+    let context = '';
+    let bypassClaude = false;
+    let rawAnswer = null;
+
+    if (command === 'upcoming') {
       const upcoming = getUpcomingJobs(jobs, days);
       const todayStr = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
       const endDate = new Date(); endDate.setDate(endDate.getDate() + days);
       const endStr = endDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
       context = upcoming.length > 0
-        ? `${upcoming.length} jobs with Initial Service Date from ${todayStr} to ${endStr}:\n\n${upcoming.map(formatJob).join('\n')}`
-        : `No jobs found with Initial Service Date between ${todayStr} and ${endStr}.`;
+        ? `${upcoming.length} jobs with Initial Service Date from ${todayStr} to ${endStr}${filterTag}:\n\n${upcoming.map(formatJob).join('\n')}`
+        : `No jobs found with Initial Service Date between ${todayStr} and ${endStr}${filterTag}.`;
 
-    } else if (intent === 'storage_billing') {
-      const daysMatch = text.match(/(\d+)\s*days?/);
-      const days = daysMatch ? parseInt(daysMatch[1]) : 7;
+    } else if (command === 'storage_billing') {
       const due = getStorageBillingDue(jobs, days);
       const todayStr = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
       const endDate = new Date(); endDate.setDate(endDate.getDate() + days);
       const endStr = endDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
       context = due.length > 0
-        ? `${due.length} jobs with storage billing due between ${todayStr} and ${endStr}:\n\n${due.map(formatStorageBilling).join('\n')}`
-        : `No storage billing due between ${todayStr} and ${endStr}.`;
+        ? `${due.length} jobs with storage billing due between ${todayStr} and ${endStr}${filterTag}:\n\n${due.map(formatStorageBilling).join('\n')}`
+        : `No storage billing due between ${todayStr} and ${endStr}${filterTag}.`;
 
-    } else if (intent === 'balances') {
+    } else if (command === 'balances') {
       const bal = getBalances(jobs);
       context = bal.length > 0
-        ? `${bal.length} jobs with outstanding balances:\n\n${bal.map(formatJob).join('\n')}`
-        : 'No outstanding balances.';
+        ? `${bal.length} jobs with outstanding balances${filterTag}:\n\n${bal.map(formatJob).join('\n')}`
+        : `No outstanding balances${filterTag}.`;
 
-    } else if (intent === 'active') {
+    } else if (command === 'active') {
       const active = getActiveJobs(jobs);
       context = active.length > 0
-        ? `${active.length} active jobs (excludes Completed, Cancelled, Future Order):\n\n${active.map(formatJob).join('\n')}`
-        : 'No active jobs found.';
+        ? `${active.length} active jobs (excludes Completed, Cancelled, Future Order)${filterTag}:\n\n${active.map(formatJob).join('\n')}`
+        : `No active jobs found${filterTag}.`;
 
-    } else if (intent === 'summary') {
+    } else if (command === 'howmany') {
+      // Scoreboard is purely numeric — bypass Claude, send the raw report.
+      const stats = getHowMany(jobs);
+      rawAnswer = `=== AVANTI SCOREBOARD${filterTag} ===\n\n` + formatHowMany(stats, jobs);
+      bypassClaude = true;
+
+    } else if (command === 'summary') {
       const upcoming = getUpcomingJobs(jobs, 7);
       const balances = getBalances(jobs);
       const storageBilling = getStorageBillingDue(jobs, 7);
       const active = getActiveJobs(jobs);
-      context = `DAILY SUMMARY\n\nUpcoming service (next 7 days): ${upcoming.length}\n${upcoming.map(formatJob).join('\n')}\n\nStorage billing due (next 7 days): ${storageBilling.length}\n${storageBilling.map(formatStorageBilling).join('\n')}\n\nOutstanding balances: ${balances.length}\n${balances.map(formatJob).join('\n')}\n\nAll active jobs (excludes Completed/Cancelled/Future Order): ${active.length}\n${active.map(formatJob).join('\n')}`;
+      context = `DAILY SUMMARY${filterTag}\n\nUpcoming service (next 7 days): ${upcoming.length}\n${upcoming.map(formatJob).join('\n')}\n\nStorage billing due (next 7 days): ${storageBilling.length}\n${storageBilling.map(formatStorageBilling).join('\n')}\n\nOutstanding balances: ${balances.length}\n${balances.map(formatJob).join('\n')}\n\nAll active jobs (excludes Completed/Cancelled/Future Order): ${active.length}\n${active.map(formatJob).join('\n')}`;
 
     } else {
-      context = `All ${jobs.length} jobs:\n\n${jobs.map(formatJob).join('\n')}`;
+      context = `All ${jobs.length} container rows${filterTag}:\n\n${jobs.map(formatJob).join('\n')}`;
     }
 
-    const answer = await askClaude(text, context);
-    await sendTelegram(chatId, answer);
+    if (bypassClaude) {
+      await sendTelegram(chatId, rawAnswer);
+    } else {
+      const answer = await askClaude(text, context);
+      await sendTelegram(chatId, answer);
+    }
 
   } catch (e) {
     console.error('Webhook error:', e.message);
